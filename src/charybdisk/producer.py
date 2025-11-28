@@ -1,32 +1,21 @@
-import base64
 import glob
-import json
 import logging
 import os
-import re
-import shutil
 import threading
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from kafka import KafkaAdminClient, KafkaProducer
 from kafka.admin import NewTopic
 from kafka.errors import KafkaError, NoBrokersAvailable
 
+from charybdisk.file_preparer import FilePreparer, backup_file, MAX_TRANSFER_FILE_SIZE
 from charybdisk.kafka_helpers import build_kafka_client_config
+from charybdisk.messages import encode_message
 
 KAFKA_CONN_RETRY_INTERVAL_SECONDS = 5
-MAX_TRANSFER_FILE_SIZE = 3 * 1024 * 1024
 
 logger = logging.getLogger('charybdisk.producer')
-
-
-def remove_text_between_T_and_extension(file_name: str) -> str:
-    name, ext = os.path.splitext(file_name)
-    pattern = r'_T\d{17}'  # Match "_T" followed by exactly 17 digits
-    new_name = re.sub(pattern, '', name) + ext
-    return new_name
 
 
 class KafkaFileProducer(threading.Thread):
@@ -42,6 +31,7 @@ class KafkaFileProducer(threading.Thread):
         self.stop_event = threading.Event()
         self.kafka_producer: Optional[KafkaProducer] = None
         self.admin_client: Optional[KafkaAdminClient] = None
+        self.file_preparer = FilePreparer(max_transfer_file_size=MAX_TRANSFER_FILE_SIZE)
         self.directories: List[Dict[str, Any]] = producer_config['directories']
         self.scan_interval: int = producer_config.get('scan_interval', 60)
 
@@ -130,70 +120,23 @@ class KafkaFileProducer(threading.Thread):
         if self.kafka_producer is None:
             raise KafkaError("Kafka producer not initialized")
 
+        prepared = self.file_preparer.prepare(file_path)
+        if prepared is None:
+            time.sleep(1)
+            return
+
         try:
-            # Check if the file is open
-            if self.is_file_open(file_path):
-                logger.warning(f"File '{file_path}' is currently open by another process, skipping.")
-                time.sleep(1)
-                return
-
-            # Check file size
-            file_size = os.path.getsize(file_path)
-            if file_size > MAX_TRANSFER_FILE_SIZE:
-                logger.warning(f"File '{file_path}' is larger than {MAX_TRANSFER_FILE_SIZE} bytes. Skipping.")
-                return
-
-            if file_size == 0:
-                logger.warning(f"File '{file_path}' is empty. Skipping.")
-                time.sleep(1)
-                return
-
-            with open(file_path, 'rb') as file:
-                content = base64.b64encode(file.read()).decode('utf-8')
-
-            no_ts_fname = remove_text_between_T_and_extension(file_path)
-            create_timestamp = datetime.fromtimestamp(os.path.getctime(file_path)).isoformat()
-            bu_file_name = f"{os.path.splitext(os.path.basename(no_ts_fname))[0]}_T{create_timestamp}{os.path.splitext(no_ts_fname)[1]}"
-
-            message = {
-                'file_name': os.path.basename(file_path),
-                'create_timestamp': create_timestamp,
-                'content': content,
-            }
-            message_bytes = json.dumps(message).encode('utf-8')
-
-            self.kafka_producer.send(topic, value=message_bytes)
+            self.kafka_producer.send(topic, value=encode_message(prepared.message))
             logger.info(
-                f"Sent file '{os.path.basename(file_path)}' (create timestamp: {create_timestamp}) to Kafka topic '{topic}' (Configuration ID: {config_id}). Backup file name: '{bu_file_name}'."
+                f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to Kafka topic '{topic}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
             )
 
-            if backup_directory:
-                self.backup_file(file_path, backup_directory, bu_file_name)
+            if backup_directory and prepared.backup_name:
+                backup_file(prepared.original_path, backup_directory, prepared.backup_name)
         except (NoBrokersAvailable, KafkaError):
             raise
-        except OSError as e:
-            logger.error(f"OS error occurred while processing file '{file_path}': {e}, continuing")
         except Exception as e:
             logger.error(f"Unexpected error occurred while processing file '{file_path}': {e}, continuing")
-
-    def backup_file(self, file_path: str, backup_directory: str, new_file_name: str) -> None:
-        try:
-            if not os.path.exists(backup_directory):
-                os.makedirs(backup_directory)
-            shutil.move(file_path, os.path.join(backup_directory, new_file_name))
-            logger.info(f"Moved file '{os.path.basename(file_path)}' to backup directory: '{backup_directory}'")
-        except Exception as e:
-            logger.error(f"Error moving file '{file_path}' to backup directory '{backup_directory}': {e}")
-            raise IOError(f"Error moving file '{file_path}' to backup directory '{backup_directory}'")
-
-    def is_file_open(self, file_path: str) -> bool:
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, 'a'):
-                    return False
-            except IOError:
-                return True
-        return False
 
     def handle_file_processing_error(self, file_path: str, error: Exception) -> None:
         if isinstance(error, (NoBrokersAvailable, KafkaError)):

@@ -1,16 +1,13 @@
-import base64
-import json
 import logging
-import os
 import threading
-from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError, NoBrokersAvailable
 
+from charybdisk.file_writer import write_file_safe
 from charybdisk.kafka_helpers import build_kafka_client_config
+from charybdisk.messages import decode_message
 
 logger = logging.getLogger('charybdisk.consumer')
 
@@ -69,53 +66,21 @@ class KafkaFileConsumer(threading.Thread):
         for message in self.consumer:
             if self.stop_event.is_set():
                 break
-            self.write_file(json.loads(message.value), message)
+            self.handle_message(message.value, message)
 
-    def write_file(self, message: Dict[str, Any], kafka_message: Any) -> None:
-        file_name = message['file_name']
-        file_content = base64.b64decode(message['content'].encode('utf-8'))
-        filepath = os.path.join(self.output_directory, file_name)
-        if self.output_suffix:
-            new_filepath = Path(filepath).with_suffix(self.output_suffix)
-            logger.debug(f'write_file() changing file suffix; old file {filepath}, new file {new_filepath}')
-            filepath = new_filepath
-
-        if not os.path.exists(self.output_directory):
-            try:
-                os.makedirs(self.output_directory)
-                logger.warning(f"Output directory '{self.output_directory}' did not exist, created it.")
-            except Exception as e:
-                logger.error(f"Error creating output directory '{self.output_directory}': {e}")
-                return
-
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, 'rb') as existing_file:
-                    existing_content = existing_file.read()
-                if existing_content == file_content:
-                    logger.info(f"File '{filepath}' already exists with identical content. Skipping write.")
-                    return
-                else:
-                    timestamp = datetime.now().strftime('%Y%m%d%H%M%S%f')
-                    new_filepath = Path(filepath).with_name(f"{Path(filepath).stem}_{timestamp}{Path(filepath).suffix}")
-                    filepath = new_filepath
-                    logger.info(f"File '{filepath}' already exists with different content. Writing new file with timestamp.")
-            except Exception as e:
-                logger.error(f"Error reading existing file '{filepath}': {e}")
-                return
-
+    def handle_message(self, raw_message: Any, kafka_message: Any) -> None:
         try:
-            with open(filepath, 'wb') as file:
-                file.write(file_content)
-            logger.info(
-                f"Received message from Kafka topic '{kafka_message.topic}': Wrote file '{Path(filepath).name}' (original: '{file_name}') to directory '{self.output_directory}'"
-            )
+            file_message = decode_message(raw_message)
         except Exception as e:
-            logger.error(
-                f"Error writing file '{filepath}' (original: '{file_name}') to directory '{self.output_directory}': {e}"
+            logger.error(f"Failed to decode message from Kafka topic '{kafka_message.topic}': {e}")
+            return
+
+        final_path = write_file_safe(self.output_directory, file_message.file_name, file_message.content, self.output_suffix)
+        if final_path:
+            logger.info(
+                f"Received message from Kafka topic '{kafka_message.topic}': Wrote file '{final_path.name}' (original: '{file_message.file_name}') to directory '{self.output_directory}'"
             )
 
     def stop(self) -> None:
         self.stop_event.set()
         self.consumer.close()
-
