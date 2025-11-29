@@ -2,6 +2,7 @@ kafka:
   broker: localhost:9092
   client_id: karussell_node
   default_group_id: KafKarussell_General_Consumer
+  # max_transfer_file_size: 3145728  # bytes; defaults to 3MB if unset
   # sasl_plain_username: ...
   # sasl_plain_password: ...
 
@@ -12,36 +13,64 @@ logging:
 
 producer:
   enabled: true
+  http:
+    # default_headers: {Authorization: "Bearer token"}
+    timeout: 30
+    max_transfer_file_size: null  # optional; null means unlimited
   scan_interval: 1
   directories:
     - id: BDKFTP_IN
+      transport: kafka
       path: 'D:\ftproot\ftproot1\BDKFTP\IN'
       backup_directory: 'D:\ftproot\ftproot1\BDKFTP\IN\SAVE'
       file_pattern: "*.txt"
       topic: "VIP_IN.BDKFTP"
 
     - id: Stadler_TEST_IN
+      transport: kafka
       path: 'D:\ftproot\ftproot2\Stadler_Test\IN'
       backup_directory: 'D:\ftproot\ftproot2\Stadler_Test\IN\SAVE'
       file_pattern: "*"
       topic: "CONV_IN.STADLER_TEST.HASLER_TEST"
 
     - id: Converter_Stadler_Hasler_Output
+      transport: kafka
       path: 'D:\Converters\Stadler_Hasler_Test\OUT'
       backup_directory: 'D:\Converters\Stadler_Hasler_Test\OUT\SAVE'
       file_pattern: "*"
       topic: "VIP_OUT.Hasler_Test"
 
+    # Example HTTP producer directory
+    #- id: HTTP_PUSH
+    #  transport: http
+    #  path: '/tmp/upload_me'
+    #  file_pattern: "*"
+    #  destination: "https://example.com/upload"
+    #  headers: {Authorization: "Bearer per-directory-token"}
+
 consumer:
   enabled: true
+  http:
+    poll_interval: 5
+    timeout: 30
+    # default_headers: {Authorization: "Bearer token"}
   start_from_end: false
   topics:
-    - topic: "VIP_IN.BDKFTP"
+    - transport: kafka
+      topic: "VIP_IN.BDKFTP"
       group_id: "consumer_group_1"
       output_directory: 'D:\Converters\VIP_IN'
-    - topic: "CONV_IN.STADLER_TEST.HASLER_TEST"
+    - transport: kafka
+      topic: "CONV_IN.STADLER_TEST.HASLER_TEST"
       group_id: "consumer_group_2"
       output_directory: 'D:\Converters\Stadler_Hasler_Test\IN'
-    - topic: "VIP_OUT.Hasler_Test"
+    - transport: kafka
+      topic: "VIP_OUT.Hasler_Test"
       group_id: "consumer_group_3"
       output_directory: 'D:\ftproot\ftproot1\Hasler\TEST\OUT'
+
+    # Example HTTP polling consumer
+    #- transport: http
+    #  url: "https://example.com/download"
+    #  output_directory: '/tmp/downloads'
+    #  headers: {Authorization: "Bearer per-entry-token"}

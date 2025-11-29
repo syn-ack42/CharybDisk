@@ -13,12 +13,36 @@ def _require(condition: bool, message: str) -> None:
         raise ConfigError(message)
 
 
+def _needs_kafka(config: Dict[str, Any]) -> bool:
+    producer_cfg = config.get('producer', {})
+    consumer_cfg = config.get('consumer', {})
+    if producer_cfg.get('enabled'):
+        for directory in producer_cfg.get('directories', []):
+            if directory.get('transport') == 'kafka':
+                return True
+    if consumer_cfg.get('enabled'):
+        for topic_cfg in consumer_cfg.get('topics', []):
+            if topic_cfg.get('transport', 'kafka') == 'kafka':
+                return True
+    return False
+
+
+def _require_destination(entry: Dict[str, Any], message: str) -> None:
+    dest = entry.get('destination') or entry.get('topic') or entry.get('url') or entry.get('endpoint')
+    _require(bool(dest), message)
+
+
+def _require_transport(entry: Dict[str, Any]) -> None:
+    transport = entry.get('transport')
+    _require(transport in ('kafka', 'http'), "Each entry requires transport: 'kafka' or 'http'")
+
+
 def validate_config(config: Dict[str, Any]) -> None:
-    _require('kafka' in config, "Configuration must include 'kafka'")
     _require('logging' in config, "Configuration must include 'logging'")
 
-    kafka_cfg = config.get('kafka', {})
-    _require('broker' in kafka_cfg, "Kafka configuration is missing 'broker'")
+    if _needs_kafka(config):
+        kafka_cfg = config.get('kafka', {})
+        _require('broker' in kafka_cfg, "Kafka configuration is missing 'broker'")
 
     producer_cfg = config.get('producer', {})
     consumer_cfg = config.get('consumer', {})
@@ -32,15 +56,25 @@ def validate_config(config: Dict[str, Any]) -> None:
         _require(isinstance(directories, list) and directories, "Producer requires non-empty 'directories' list")
         for directory in directories:
             _require('path' in directory, "Each producer directory requires 'path'")
-            _require('topic' in directory, "Each producer directory requires 'topic'")
             _require('id' in directory, "Each producer directory requires 'id'")
+            _require_transport(directory)
+            _require_destination(directory, "Each producer directory requires 'topic' (Kafka) or 'url' (HTTP)")
+            if directory.get('transport') == 'kafka':
+                _require('topic' in directory, "Kafka producer directory requires 'topic'")
+            if directory.get('transport') == 'http':
+                _require(any(k in directory for k in ('destination', 'url', 'endpoint')), "HTTP producer directory requires 'destination'/'url'")
 
     if consumer_cfg.get('enabled'):
         topics = consumer_cfg.get('topics', [])
         _require(isinstance(topics, list) and topics, "Consumer requires non-empty 'topics' list")
         for topic_cfg in topics:
-            _require('topic' in topic_cfg, "Each consumer topic requires 'topic'")
             _require('output_directory' in topic_cfg, "Each consumer topic requires 'output_directory'")
+            _require_transport(topic_cfg)
+            _require_destination(topic_cfg, "Each consumer topic requires 'topic' (Kafka) or 'url' (HTTP)")
+            if topic_cfg.get('transport') == 'kafka':
+                _require('topic' in topic_cfg, "Kafka consumer entry requires 'topic'")
+            if topic_cfg.get('transport') == 'http':
+                _require(any(k in topic_cfg for k in ('url', 'endpoint')), "HTTP consumer entry requires 'url'")
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -55,4 +89,3 @@ def load_config(path: str) -> Dict[str, Any]:
 
     validate_config(data)
     return data
-

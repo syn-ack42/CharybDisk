@@ -5,22 +5,21 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from kafka import KafkaAdminClient, KafkaProducer
-from kafka.admin import NewTopic
 from kafka.errors import KafkaError, NoBrokersAvailable
 
-from charybdisk.file_preparer import FilePreparer, backup_file, MAX_TRANSFER_FILE_SIZE
-from charybdisk.kafka_helpers import build_kafka_client_config
-from charybdisk.messages import encode_message
+from charybdisk.file_preparer import DEFAULT_MAX_TRANSFER_FILE_SIZE, FilePreparer, backup_file
+from charybdisk.transports.base import SendResult, Transport
+from charybdisk.transports.http_transport import HttpTransport
+from charybdisk.transports.kafka_transport import KafkaTransport
 
 KAFKA_CONN_RETRY_INTERVAL_SECONDS = 5
 
 logger = logging.getLogger('charybdisk.producer')
 
 
-class KafkaFileProducer(threading.Thread):
+class FileProducer(threading.Thread):
     """
-    Watches configured directories and publishes files to Kafka topics.
+    Watches configured directories and publishes files using the configured transport (Kafka/HTTP) per directory.
     Runs in its own thread so it can coexist with consumers in a single process.
     """
 
@@ -29,53 +28,59 @@ class KafkaFileProducer(threading.Thread):
         self.producer_config = producer_config
         self.kafka_config = kafka_config
         self.stop_event = threading.Event()
-        self.kafka_producer: Optional[KafkaProducer] = None
-        self.admin_client: Optional[KafkaAdminClient] = None
-        self.file_preparer = FilePreparer(max_transfer_file_size=MAX_TRANSFER_FILE_SIZE)
+        self.file_preparer = FilePreparer(max_transfer_file_size=None)  # per-transport limit applied at call time
         self.directories: List[Dict[str, Any]] = producer_config['directories']
         self.scan_interval: int = producer_config.get('scan_interval', 60)
+        self.default_http_config = producer_config.get('http', {})
+        self.kafka_transport: Optional[KafkaTransport] = None
+        self.http_transports: Dict[str, HttpTransport] = {}
+
+        self._init_kafka_transport_if_needed()
+
+    def _init_kafka_transport_if_needed(self) -> None:
+        kafka_dirs = [d for d in self.directories if d.get('transport') == 'kafka']
+        if not kafka_dirs:
+            return
+        self.kafka_transport = KafkaTransport(self.kafka_config)
+        topics = {d['topic']: d for d in kafka_dirs if d.get('topic')}
+        self.kafka_transport.ensure_topics(topics)
+
+    def _get_transport_for_directory(self, directory: Dict[str, Any]) -> Optional[Transport]:
+        mode = directory.get('transport')
+        if mode == 'kafka':
+            if self.kafka_transport is None:
+                logger.error("Kafka transport requested but not initialized.")
+            return self.kafka_transport
+        if mode == 'http':
+            dir_id = directory['id']
+            if dir_id not in self.http_transports:
+                self.http_transports[dir_id] = HttpTransport(self._merged_http_config(directory))
+            return self.http_transports[dir_id]
+        logger.error(f"Unknown transport '{mode}' for directory '{directory.get('id')}'.")
+        return None
+
+    def _merged_http_config(self, directory: Dict[str, Any]) -> Dict[str, Any]:
+        cfg = dict(self.default_http_config)
+        dir_http_cfg = directory.get('http', {})
+        cfg.update({k: v for k, v in dir_http_cfg.items() if k != 'headers'})
+
+        default_headers = dict(self.default_http_config.get('default_headers', {}))
+        dir_headers = directory.get('headers') or dir_http_cfg.get('headers') or {}
+        default_headers.update(dir_headers)
+        cfg['default_headers'] = default_headers
+        return cfg
 
     def run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                self.setup_kafka()
-                logger.info("Kafka file producer connected successfully.")
                 self.produce_messages()
-            except (NoBrokersAvailable, KafkaError) as e:
-                logger.error(
-                    f"No brokers available or Kafka error. Retrying in {KAFKA_CONN_RETRY_INTERVAL_SECONDS} seconds...; error: {e}"
-                )
-                self._wait_before_retry()
             except Exception as e:
                 logger.error(
-                    f"Failed to start Kafka file producer. Retrying in {KAFKA_CONN_RETRY_INTERVAL_SECONDS} seconds...; error: {e}"
+                    f"File producer encountered an error. Retrying in {KAFKA_CONN_RETRY_INTERVAL_SECONDS} seconds...; error: {e}"
                 )
                 self._wait_before_retry()
             finally:
-                self.close_producer()
-
-    def setup_kafka(self) -> None:
-        kafka_client_config = build_kafka_client_config(self.kafka_config)
-        self.admin_client = KafkaAdminClient(**kafka_client_config)
-        self.kafka_producer = KafkaProducer(**kafka_client_config)
-        logger.info(f'Created KafkaProducer with id {self.kafka_config.get("client_id")}')
-        self.create_topics()
-
-    def create_topics(self) -> None:
-        if self.admin_client is None:
-            return
-
-        try:
-            existing_topics = self.admin_client.list_topics()
-            for directory in self.directories:
-                topic = directory['topic']
-                if topic not in existing_topics:
-                    new_topic = NewTopic(name=topic, num_partitions=1, replication_factor=3)
-                    self.admin_client.create_topics([new_topic])
-                    logger.debug(f'Created new Kafka topic "{topic}" for directory watcher with ID "{directory["id"]}"')
-        except KafkaError as e:
-            logger.error(f"Failed to create topics: {e}")
-            raise
+                self.transport.stop()
 
     def produce_messages(self) -> None:
         logger.info("Starting to watch directories.")
@@ -93,10 +98,18 @@ class KafkaFileProducer(threading.Thread):
 
     def process_directory(self, directory: Dict[str, Any]) -> None:
         directory_path = directory['path']
-        topic = directory['topic']
+        destination = directory.get('destination') or directory.get('topic') or directory.get('url')
         config_id = directory['id']
         file_pattern = directory.get('file_pattern', '*')
         backup_directory = directory.get('backup_directory')
+        transport = self._get_transport_for_directory(directory)
+
+        if not destination:
+            logger.error(f"Directory config '{config_id}' missing destination (topic/url). Skipping.")
+            return
+        if transport is None:
+            logger.error(f"Directory config '{config_id}' has no usable transport. Skipping.")
+            return
 
         if not os.path.exists(directory_path):
             logger.error(f"Directory '{directory_path}' does not exist.")
@@ -112,23 +125,22 @@ class KafkaFileProducer(threading.Thread):
             if self.stop_event.is_set():
                 break
             try:
-                self.process_file(file_path, topic, config_id, backup_directory)
+                self.process_file(file_path, destination, config_id, backup_directory, transport)
             except Exception as e:
                 self.handle_file_processing_error(file_path, e)
 
-    def process_file(self, file_path: str, topic: str, config_id: str, backup_directory: Optional[str]) -> None:
-        if self.kafka_producer is None:
-            raise KafkaError("Kafka producer not initialized")
-
-        prepared = self.file_preparer.prepare(file_path)
+    def process_file(self, file_path: str, destination: str, config_id: str, backup_directory: Optional[str], transport: Transport) -> None:
+        prepared = self.file_preparer.prepare(file_path, transport.max_transfer_size())
         if prepared is None:
             time.sleep(1)
             return
 
         try:
-            self.kafka_producer.send(topic, value=encode_message(prepared.message))
+            result: SendResult = transport.send(destination, prepared.message)
+            if not result.success:
+                raise result.error or Exception("Unknown transport send error")
             logger.info(
-                f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to Kafka topic '{topic}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
+                f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to destination '{destination}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
             )
 
             if backup_directory and prepared.backup_name:
@@ -140,14 +152,14 @@ class KafkaFileProducer(threading.Thread):
 
     def handle_file_processing_error(self, file_path: str, error: Exception) -> None:
         if isinstance(error, (NoBrokersAvailable, KafkaError)):
-            logger.error(f"Kafka error occurred while processing file '{file_path}': {error}")
+            logger.error(f"Transport error occurred while processing file '{file_path}': {error}")
             raise
         else:
             logger.error(f"Error processing file '{file_path}': {error}, continuing")
 
     def handle_directory_processing_error(self, directory: Dict[str, Any], error: Exception) -> None:
         if isinstance(error, (NoBrokersAvailable, KafkaError)):
-            logger.error(f"Kafka error occurred while processing directory '{directory['path']}': {error}")
+            logger.error(f"Transport error occurred while processing directory '{directory['path']}': {error}")
             raise
         else:
             logger.error(f"Error processing directory '{directory['path']}': {error}, continuing")
@@ -155,11 +167,9 @@ class KafkaFileProducer(threading.Thread):
     def _wait_before_retry(self) -> None:
         self.stop_event.wait(KAFKA_CONN_RETRY_INTERVAL_SECONDS)
 
-    def close_producer(self) -> None:
-        if self.kafka_producer is not None:
-            self.kafka_producer.close()
-        if self.admin_client is not None:
-            self.admin_client.close()
-
     def stop(self) -> None:
         self.stop_event.set()
+        if self.kafka_transport:
+            self.kafka_transport.stop()
+        for transport in self.http_transports.values():
+            transport.stop()

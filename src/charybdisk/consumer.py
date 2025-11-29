@@ -1,86 +1,76 @@
 import logging
 import threading
-from typing import Any, Dict, Optional
-
-from kafka import KafkaConsumer
-from kafka.errors import KafkaError, NoBrokersAvailable
+from typing import Any, Dict, List, Optional
 
 from charybdisk.file_writer import write_file_safe
-from charybdisk.kafka_helpers import build_kafka_client_config
-from charybdisk.messages import decode_message
+from charybdisk.messages import FileMessage
+from charybdisk.transports.http_transport import HttpPoller
+from charybdisk.transports.kafka_transport import KafkaReceiver
 
 logger = logging.getLogger('charybdisk.consumer')
 
 
-class KafkaFileConsumer(threading.Thread):
+class FileConsumerGroup(threading.Thread):
     """
-    Consumes files from Kafka topics and writes them to the configured output directories.
-    Each consumer runs on its own thread.
+    Starts one receiver per consumer config entry (Kafka or HTTP) and writes files safely to disk.
     """
 
-    def __init__(
-        self,
-        kafka_config: Dict[str, Any],
-        topic_config: Dict[str, Any],
-        start_from_end: bool,
-        default_group_id: Optional[str] = None,
-    ) -> None:
+    def __init__(self, consumer_config: Dict[str, Any], kafka_config: Dict[str, Any]) -> None:
         super().__init__(daemon=True)
+        self.consumer_config = consumer_config
         self.kafka_config = kafka_config
-        self.topic_config = topic_config
-        self.group_id = topic_config.get('group_id', default_group_id or kafka_config.get('default_group_id', 'default_group'))
-        self.output_directory = topic_config['output_directory']
-        self.output_suffix = topic_config.get('output_suffix')
+        self.receivers: List[threading.Thread] = []
         self.stop_event = threading.Event()
 
-        if self.output_suffix and not self.output_suffix.startswith('.'):
-            self.output_suffix = f'.{self.output_suffix}'
-
-        kafka_consumer_config = build_kafka_client_config(kafka_config)
-        kafka_consumer_config.update({
-            'group_id': self.group_id,
-            'auto_offset_reset': 'latest' if start_from_end else kafka_config.get('auto_offset_reset', 'earliest'),
-            'enable_auto_commit': kafka_config.get('enable_auto_commit', True),
-            'value_deserializer': lambda x: x.decode('utf-8'),
-        })
-
-        self.consumer = KafkaConsumer(
-            topic_config['topic'],
-            **kafka_consumer_config,
-        )
-        logger.info(
-            f'Created a new consumer for topic {topic_config["topic"]}, group id: {self.group_id}, client id: {kafka_config.get("client_id")}'
-        )
-
     def run(self) -> None:
-        try:
-            self.consume_messages()
-        except (NoBrokersAvailable, KafkaError) as e:
-            logger.error(f"Kafka error in consumer for topic '{self.topic_config['topic']}': {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error in consumer for topic '{self.topic_config['topic']}': {e}")
-        finally:
-            self.consumer.close()
+        start_from_end = self.consumer_config.get('start_from_end', False)
+        default_group_id = self.kafka_config.get('default_group_id')
+        default_http_cfg = self.consumer_config.get('http', {})
 
-    def consume_messages(self) -> None:
-        for message in self.consumer:
-            if self.stop_event.is_set():
-                break
-            self.handle_message(message.value, message)
+        for topic_cfg in self.consumer_config.get('topics', []):
+            transport = topic_cfg.get('transport')
+            output_directory = topic_cfg['output_directory']
+            output_suffix = topic_cfg.get('output_suffix')
+            on_message = self._build_handler(output_directory, output_suffix)
 
-    def handle_message(self, raw_message: Any, kafka_message: Any) -> None:
-        try:
-            file_message = decode_message(raw_message)
-        except Exception as e:
-            logger.error(f"Failed to decode message from Kafka topic '{kafka_message.topic}': {e}")
-            return
+            if transport == 'http':
+                url = topic_cfg.get('url') or topic_cfg.get('endpoint')
+                if not url:
+                    logger.error("HTTP consumer entry missing 'url'/'endpoint'")
+                    continue
+                headers = topic_cfg.get('headers') or {}
+                http_cfg = dict(default_http_cfg)
+                http_cfg.update({k: v for k, v in (topic_cfg.get('http') or {}).items() if k != 'headers'})
+                receiver = HttpPoller(http_cfg, url, on_message, headers=headers)
+            else:
+                topic = topic_cfg.get('topic')
+                if not topic:
+                    logger.error("Kafka consumer entry missing 'topic'")
+                    continue
+                group_id = topic_cfg.get('group_id', default_group_id)
+                receiver = KafkaReceiver(self.kafka_config, topic, group_id, start_from_end, on_message)
 
-        final_path = write_file_safe(self.output_directory, file_message.file_name, file_message.content, self.output_suffix)
-        if final_path:
-            logger.info(
-                f"Received message from Kafka topic '{kafka_message.topic}': Wrote file '{final_path.name}' (original: '{file_message.file_name}') to directory '{self.output_directory}'"
-            )
+            receiver.start()
+            self.receivers.append(receiver)
+
+        # Keep thread alive while receivers run
+        while not self.stop_event.is_set():
+            self.stop_event.wait(1)
+
+    def _build_handler(self, output_directory: str, output_suffix: Optional[str]):
+        def handle(file_message: FileMessage) -> None:
+            final_path = write_file_safe(output_directory, file_message.file_name, file_message.content, output_suffix)
+            if final_path:
+                logger.info(
+                    f"Wrote file '{final_path.name}' (original: '{file_message.file_name}') to directory '{output_directory}'"
+                )
+        return handle
 
     def stop(self) -> None:
         self.stop_event.set()
-        self.consumer.close()
+        for receiver in self.receivers:
+            stop_fn = getattr(receiver, 'stop', None)
+            if callable(stop_fn):
+                stop_fn()
+        for receiver in self.receivers:
+            receiver.join(timeout=2)

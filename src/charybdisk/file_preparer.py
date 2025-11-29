@@ -10,7 +10,7 @@ from charybdisk.messages import FileMessage
 
 logger = logging.getLogger('charybdisk.file_preparer')
 
-MAX_TRANSFER_FILE_SIZE = 3 * 1024 * 1024
+DEFAULT_MAX_TRANSFER_FILE_SIZE = 3 * 1024 * 1024
 
 
 @dataclass
@@ -37,7 +37,7 @@ class FilePreparer:
     Prepares files for transfer: guards against locked/oversized files and builds the transfer payload.
     """
 
-    def __init__(self, max_transfer_file_size: int = MAX_TRANSFER_FILE_SIZE) -> None:
+    def __init__(self, max_transfer_file_size: Optional[int] = DEFAULT_MAX_TRANSFER_FILE_SIZE) -> None:
         self.max_transfer_file_size = max_transfer_file_size
 
     def is_file_open(self, file_path: str) -> bool:
@@ -49,7 +49,7 @@ class FilePreparer:
                 return True
         return False
 
-    def prepare(self, file_path: str) -> Optional[PreparedFile]:
+    def prepare(self, file_path: str, max_size_override: Optional[int] = None) -> Optional[PreparedFile]:
         # Check if the file is open
         if self.is_file_open(file_path):
             logger.warning(f"File '{file_path}' is currently open by another process, skipping.")
@@ -61,8 +61,9 @@ class FilePreparer:
 
         # Check file size
         file_size = os.path.getsize(file_path)
-        if file_size > self.max_transfer_file_size:
-            logger.warning(f"File '{file_path}' is larger than {self.max_transfer_file_size} bytes. Skipping.")
+        size_limit = max_size_override if max_size_override is not None else self.max_transfer_file_size
+        if size_limit is not None and file_size > size_limit:
+            logger.warning(f"File '{file_path}' is larger than {size_limit} bytes. Skipping.")
             return None
 
         if file_size == 0:
@@ -95,4 +96,3 @@ def backup_file(file_path: str, backup_directory: str, new_file_name: str) -> No
     except Exception as e:
         logger.error(f"Error moving file '{file_path}' to backup directory '{backup_directory}': {e}")
         raise IOError(f"Error moving file '{file_path}' to backup directory '{backup_directory}'")
-
