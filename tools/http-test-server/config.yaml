@@ -1,0 +1,16 @@
+upload_endpoints:
+  - path: /upload
+    save_dir: /data/upload
+    # done_dir: /data/upload/done
+    # auth:
+    #   type: basic
+    #   username: user
+    #   password: pass
+
+download_endpoints:
+  - path: /download
+    input_dir: /data/upload
+    done_dir: /data/upload/done
+    # auth:
+    #   type: bearer
+    #   token: secret-token

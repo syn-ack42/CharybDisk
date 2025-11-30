@@ -145,6 +145,12 @@ class FileProducer(threading.Thread):
 
             if backup_directory and prepared.backup_name:
                 backup_file(prepared.original_path, backup_directory, prepared.backup_name)
+            elif backup_directory is None:
+                try:
+                    os.remove(prepared.original_path)
+                    logger.info(f"Removed source file '{prepared.original_path}' after successful send (no backup configured).")
+                except Exception as e:
+                    logger.error(f"Failed to remove source file '{prepared.original_path}' after send: {e}")
         except (NoBrokersAvailable, KafkaError):
             raise
         except Exception as e:

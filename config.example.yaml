@@ -19,26 +19,19 @@ producer:
     max_transfer_file_size: null  # optional; null means unlimited
   scan_interval: 1
   directories:
-    - id: BDKFTP_IN
+    - id: TEST_OUT1
       transport: kafka
-      path: 'D:\ftproot\ftproot1\BDKFTP\IN'
-      backup_directory: 'D:\ftproot\ftproot1\BDKFTP\IN\SAVE'
+      path: 'D:\test\out\out1'
+      backup_directory: 'D:\test\out\out1\SAVE'
       file_pattern: "*.txt"
-      topic: "VIP_IN.BDKFTP"
+      topic: "TEST1"
 
-    - id: Stadler_TEST_IN
+    - id: TEST_OUT2
       transport: kafka
-      path: 'D:\ftproot\ftproot2\Stadler_Test\IN'
-      backup_directory: 'D:\ftproot\ftproot2\Stadler_Test\IN\SAVE'
+      path: 'D:\test\out\out2'
+      backup_directory: 'D:\test\out\out2\SAVE'
       file_pattern: "*"
-      topic: "CONV_IN.STADLER_TEST.HASLER_TEST"
-
-    - id: Converter_Stadler_Hasler_Output
-      transport: kafka
-      path: 'D:\Converters\Stadler_Hasler_Test\OUT'
-      backup_directory: 'D:\Converters\Stadler_Hasler_Test\OUT\SAVE'
-      file_pattern: "*"
-      topic: "VIP_OUT.Hasler_Test"
+      topic: "TEST2"
 
     # Example HTTP producer directory
     #- id: HTTP_PUSH
@@ -57,17 +50,13 @@ consumer:
   start_from_end: false
   topics:
     - transport: kafka
-      topic: "VIP_IN.BDKFTP"
+      topic: "TEST1"
       group_id: "consumer_group_1"
-      output_directory: 'D:\Converters\VIP_IN'
+      output_directory: 'D:\Receive\TEST_IN'
     - transport: kafka
-      topic: "CONV_IN.STADLER_TEST.HASLER_TEST"
+      topic: "TEST2"
       group_id: "consumer_group_2"
-      output_directory: 'D:\Converters\Stadler_Hasler_Test\IN'
-    - transport: kafka
-      topic: "VIP_OUT.Hasler_Test"
-      group_id: "consumer_group_3"
-      output_directory: 'D:\ftproot\ftproot1\Hasler\TEST\OUT'
+      output_directory: 'D:\Receive\TEST2\IN'
 
     # Example HTTP polling consumer
     #- transport: http
