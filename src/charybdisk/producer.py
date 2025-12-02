@@ -80,7 +80,7 @@ class FileProducer(threading.Thread):
                 )
                 self._wait_before_retry()
             finally:
-                self.transport.stop()
+                self._stop_transports()
 
     def produce_messages(self) -> None:
         logger.info("Starting to watch directories.")
@@ -103,6 +103,7 @@ class FileProducer(threading.Thread):
         file_pattern = directory.get('file_pattern', '*')
         backup_directory = directory.get('backup_directory')
         transport = self._get_transport_for_directory(directory)
+        error_directory = directory.get('error_directory') or os.path.join(directory_path, 'error')
 
         if not destination:
             logger.error(f"Directory config '{config_id}' missing destination (topic/url). Skipping.")
@@ -125,11 +126,19 @@ class FileProducer(threading.Thread):
             if self.stop_event.is_set():
                 break
             try:
-                self.process_file(file_path, destination, config_id, backup_directory, transport)
+                self.process_file(file_path, destination, config_id, backup_directory, transport, error_directory)
             except Exception as e:
                 self.handle_file_processing_error(file_path, e)
 
-    def process_file(self, file_path: str, destination: str, config_id: str, backup_directory: Optional[str], transport: Transport) -> None:
+    def process_file(
+        self,
+        file_path: str,
+        destination: str,
+        config_id: str,
+        backup_directory: Optional[str],
+        transport: Transport,
+        error_directory: Optional[str],
+    ) -> None:
         prepared = self.file_preparer.prepare(file_path, transport.max_transfer_size())
         if prepared is None:
             time.sleep(1)
@@ -139,10 +148,10 @@ class FileProducer(threading.Thread):
             result: SendResult = transport.send(destination, prepared.message)
             if not result.success:
                 raise result.error or Exception("Unknown transport send error")
+
             logger.info(
                 f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to destination '{destination}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
             )
-
             if backup_directory and prepared.backup_name:
                 backup_file(prepared.original_path, backup_directory, prepared.backup_name)
             elif backup_directory is None:
@@ -151,10 +160,16 @@ class FileProducer(threading.Thread):
                     logger.info(f"Removed source file '{prepared.original_path}' after successful send (no backup configured).")
                 except Exception as e:
                     logger.error(f"Failed to remove source file '{prepared.original_path}' after send: {e}")
-        except (NoBrokersAvailable, KafkaError):
-            raise
         except Exception as e:
-            logger.error(f"Unexpected error occurred while processing file '{file_path}': {e}, continuing")
+            logger.error(f"Transport send failed for file '{file_path}': {e}")
+            if error_directory:
+                try:
+                    os.makedirs(error_directory, exist_ok=True)
+                    dest = os.path.join(error_directory, os.path.basename(file_path))
+                    os.replace(file_path, dest)
+                    logger.info(f"Moved file '{file_path}' to error directory '{error_directory}' after send failure.")
+                except Exception as move_err:
+                    logger.error(f"Failed to move file '{file_path}' to error directory '{error_directory}': {move_err}")
 
     def handle_file_processing_error(self, file_path: str, error: Exception) -> None:
         if isinstance(error, (NoBrokersAvailable, KafkaError)):
@@ -175,7 +190,16 @@ class FileProducer(threading.Thread):
 
     def stop(self) -> None:
         self.stop_event.set()
+        self._stop_transports()
+
+    def _stop_transports(self) -> None:
         if self.kafka_transport:
-            self.kafka_transport.stop()
+            try:
+                self.kafka_transport.stop()
+            except Exception as e:
+                logger.error(f"Error stopping Kafka transport: {e}")
         for transport in self.http_transports.values():
-            transport.stop()
+            try:
+                transport.stop()
+            except Exception as e:
+                logger.error(f"Error stopping HTTP transport: {e}")

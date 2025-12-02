@@ -4,7 +4,7 @@ from typing import Any, Callable, Dict, Optional
 
 from kafka import KafkaAdminClient, KafkaConsumer, KafkaProducer
 from kafka.admin import NewTopic
-from kafka.errors import KafkaError, NoBrokersAvailable
+from kafka.errors import KafkaError, NoBrokersAvailable, TopicAlreadyExistsError
 
 from charybdisk.kafka_helpers import build_kafka_client_config
 from charybdisk.messages import FileMessage, decode_message, encode_message
@@ -18,6 +18,7 @@ class KafkaTransport(Transport):
         self.kafka_config = kafka_config
         self.kafka_producer: Optional[KafkaProducer] = None
         self.admin_client: Optional[KafkaAdminClient] = None
+        self.replication_factor: int = kafka_config.get('replication_factor', 1)
         self._setup()
 
     def _setup(self) -> None:
@@ -33,20 +34,27 @@ class KafkaTransport(Transport):
             existing_topics = self.admin_client.list_topics()
             for topic in topics.keys():
                 if topic not in existing_topics:
-                    new_topic = NewTopic(name=topic, num_partitions=1, replication_factor=3)
+                    new_topic = NewTopic(name=topic, num_partitions=1, replication_factor=self.replication_factor)
                     self.admin_client.create_topics([new_topic])
                     logger.debug(f'Created new Kafka topic "{topic}"')
         except KafkaError as e:
-            logger.error(f"Failed to create topics: {e}")
-            raise
+            # Ignore "already exists" errors; re-raise others
+            if isinstance(e, TopicAlreadyExistsError) or "already exists" in str(e):
+                logger.info(f"Topic creation skipped (already exists): {e}")
+            else:
+                logger.error(f"Failed to create topics: {e}")
+                raise
 
     def send(self, destination: str, message: FileMessage) -> SendResult:
         if self.kafka_producer is None:
             return SendResult(False, KafkaError("Kafka producer not initialized"))
         try:
-            self.kafka_producer.send(destination, value=encode_message(message))
+            future = self.kafka_producer.send(destination, value=encode_message(message))
+            # Block briefly to surface broker-side errors
+            future.get(timeout=10)
             return SendResult(True)
         except Exception as e:
+            logger.error(f"Kafka send failed for topic '{destination}': {e}")
             return SendResult(False, e)
 
     def max_transfer_size(self) -> Optional[int]:
