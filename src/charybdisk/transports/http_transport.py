@@ -81,7 +81,17 @@ class HttpPoller(Receiver, threading.Thread):
                         file_name = resp.headers.get('X-File-Name', 'file.bin')
                         create_timestamp = resp.headers.get('X-Create-Timestamp', '')
                         content = resp.content
-                        self.on_message(FileMessage(file_name=file_name, create_timestamp=create_timestamp, content=content))
+                        self.on_message(
+                            FileMessage(
+                                file_name=file_name,
+                                create_timestamp=create_timestamp,
+                                content=content,
+                                file_id=file_name,
+                                chunk_index=0,
+                                total_chunks=1,
+                                original_size=len(content),
+                            )
+                        )
                         continue
 
                     logger.error(f"HTTP poll failed {resp.status_code}: {resp.text}")

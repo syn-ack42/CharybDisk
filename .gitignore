@@ -209,3 +209,4 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 CharybDisk.code-workspace
+/tools/http-test-server/data

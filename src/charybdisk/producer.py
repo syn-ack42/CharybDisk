@@ -153,8 +153,12 @@ class FileProducer(threading.Thread):
                 return
 
             file_bytes = prepared.message.content
-            max_transport_size = transport.max_transfer_size() or self.chunk_size
-            base_chunk_size = min(self.chunk_size, max_transport_size, int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
+            is_http = isinstance(transport, HttpTransport)
+            max_transport_size = transport.max_transfer_size() or len(file_bytes)
+            if is_http:
+                base_chunk_size = len(file_bytes)
+            else:
+                base_chunk_size = min(self.chunk_size, max_transport_size, int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
             chunk_size = max(1, base_chunk_size)
             total_chunks = max(1, (len(file_bytes) + chunk_size - 1) // chunk_size)
             file_id = f"{prepared.message.file_name}-{uuid.uuid4().hex}"
