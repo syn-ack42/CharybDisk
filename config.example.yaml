@@ -13,6 +13,9 @@ logging:
 
 producer:
   enabled: true
+  # kafka max request size is ~1MB by default; chunk_size_bytes defaults to 60% of max_message_bytes to fit after base64/metadata
+  # max_message_bytes: 1000000
+  # chunk_size_bytes: 600000
   http:
     # default_headers: {Authorization: "Bearer token"}
     timeout: 30
@@ -47,6 +50,7 @@ consumer:
     poll_interval: 5
     timeout: 30
     # default_headers: {Authorization: "Bearer token"}
+  working_directory: /tmp/charybdisk_parts
   start_from_end: false
   topics:
     - transport: kafka

@@ -24,6 +24,7 @@ def test_file_preparer_builds_message():
         assert prepared is not None
         assert prepared.message.file_name == "small.txt"
         assert prepared.message.content == b"hi"
+        assert prepared.message.total_chunks == 1
 
 
 def test_write_file_safe_creates_directories_and_writes():

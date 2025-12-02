@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import shutil
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -82,6 +83,10 @@ class FilePreparer:
             file_name=os.path.basename(file_path),
             create_timestamp=create_timestamp,
             content=content,
+            file_id=f"{os.path.basename(file_path)}-{uuid.uuid4().hex}",
+            chunk_index=0,
+            total_chunks=1,
+            original_size=len(content),
         )
         backup_name = build_backup_name(file_path, create_timestamp)
         return PreparedFile(original_path=file_path, message=message, backup_name=backup_name)

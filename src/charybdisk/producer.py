@@ -8,11 +8,16 @@ from typing import Any, Dict, List, Optional
 from kafka.errors import KafkaError, NoBrokersAvailable
 
 from charybdisk.file_preparer import DEFAULT_MAX_TRANSFER_FILE_SIZE, FilePreparer, backup_file
+from charybdisk.messages import FileMessage
 from charybdisk.transports.base import SendResult, Transport
 from charybdisk.transports.http_transport import HttpTransport
 from charybdisk.transports.kafka_transport import KafkaTransport
+import uuid
 
 KAFKA_CONN_RETRY_INTERVAL_SECONDS = 5
+DEFAULT_MAX_MESSAGE_BYTES = 1_000_000
+DEFAULT_CHUNK_FRACTION = 0.6  # leave headroom for base64+metadata
+DEFAULT_CHUNK_SIZE = int(DEFAULT_MAX_MESSAGE_BYTES * DEFAULT_CHUNK_FRACTION)
 
 logger = logging.getLogger('charybdisk.producer')
 
@@ -34,6 +39,8 @@ class FileProducer(threading.Thread):
         self.default_http_config = producer_config.get('http', {})
         self.kafka_transport: Optional[KafkaTransport] = None
         self.http_transports: Dict[str, HttpTransport] = {}
+        self.max_message_bytes = producer_config.get('max_message_bytes') or kafka_config.get('max_message_bytes') or DEFAULT_MAX_MESSAGE_BYTES
+        self.chunk_size = producer_config.get('chunk_size_bytes', int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
 
         self._init_kafka_transport_if_needed()
 
@@ -139,27 +146,50 @@ class FileProducer(threading.Thread):
         transport: Transport,
         error_directory: Optional[str],
     ) -> None:
-        prepared = self.file_preparer.prepare(file_path, transport.max_transfer_size())
-        if prepared is None:
-            time.sleep(1)
-            return
-
         try:
-            result: SendResult = transport.send(destination, prepared.message)
-            if not result.success:
-                raise result.error or Exception("Unknown transport send error")
+            prepared = self.file_preparer.prepare(file_path, transport.max_transfer_size())
+            if prepared is None:
+                time.sleep(1)
+                return
 
-            logger.info(
-                f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to destination '{destination}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
-            )
-            if backup_directory and prepared.backup_name:
-                backup_file(prepared.original_path, backup_directory, prepared.backup_name)
-            elif backup_directory is None:
-                try:
-                    os.remove(prepared.original_path)
-                    logger.info(f"Removed source file '{prepared.original_path}' after successful send (no backup configured).")
-                except Exception as e:
-                    logger.error(f"Failed to remove source file '{prepared.original_path}' after send: {e}")
+            file_bytes = prepared.message.content
+            max_transport_size = transport.max_transfer_size() or self.chunk_size
+            base_chunk_size = min(self.chunk_size, max_transport_size, int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
+            chunk_size = max(1, base_chunk_size)
+            total_chunks = max(1, (len(file_bytes) + chunk_size - 1) // chunk_size)
+            file_id = f"{prepared.message.file_name}-{uuid.uuid4().hex}"
+            all_sent = True
+
+            for idx in range(total_chunks):
+                start = idx * chunk_size
+                end = start + chunk_size
+                chunk = file_bytes[start:end]
+                chunk_msg = FileMessage(
+                    file_name=prepared.message.file_name,
+                    create_timestamp=prepared.message.create_timestamp,
+                    content=chunk,
+                    file_id=file_id,
+                    chunk_index=idx,
+                    total_chunks=total_chunks,
+                    original_size=len(file_bytes),
+                )
+                result: SendResult = transport.send(destination, chunk_msg)
+                if not result.success:
+                    all_sent = False
+                    raise result.error or Exception("Unknown transport send error")
+
+            if all_sent:
+                logger.info(
+                    f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to destination '{destination}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
+                )
+                if backup_directory and prepared.backup_name:
+                    backup_file(prepared.original_path, backup_directory, prepared.backup_name)
+                elif backup_directory is None:
+                    try:
+                        os.remove(prepared.original_path)
+                        logger.info(f"Removed source file '{prepared.original_path}' after successful send (no backup configured).")
+                    except Exception as e:
+                        logger.error(f"Failed to remove source file '{prepared.original_path}' after send: {e}")
         except Exception as e:
             logger.error(f"Transport send failed for file '{file_path}': {e}")
             if error_directory:
