@@ -29,7 +29,7 @@ class FileProducer(threading.Thread):
     """
 
     def __init__(self, producer_config: Dict[str, Any], kafka_config: Dict[str, Any]) -> None:
-        super().__init__(daemon=True)
+        super().__init__(daemon=False)
         self.producer_config = producer_config
         self.kafka_config = kafka_config
         self.stop_event = threading.Event()
@@ -42,18 +42,21 @@ class FileProducer(threading.Thread):
         self.max_message_bytes = producer_config.get('max_message_bytes') or kafka_config.get('max_message_bytes') or DEFAULT_MAX_MESSAGE_BYTES
         self.chunk_size = producer_config.get('chunk_size_bytes', int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
 
+        self._init_kafka_transport_if_needed()
+
+    def _init_kafka_transport_if_needed(self) -> None:
+        kafka_dirs = [d for d in self.directories if d.get('transport') == 'kafka']
+        if not kafka_dirs:
+            return
+        self.kafka_transport = KafkaTransport(self.kafka_config)
+        topics = {d['topic']: d for d in kafka_dirs if d.get('topic')}
+        self.kafka_transport.ensure_topics(topics)
+
     def _get_transport_for_directory(self, directory: Dict[str, Any]) -> Optional[Transport]:
         mode = directory.get('transport')
         if mode == 'kafka':
             if self.kafka_transport is None:
-                try:
-                    self.kafka_transport = KafkaTransport(self.kafka_config)
-                    topics = {d['topic']: d for d in self.directories if d.get('transport') == 'kafka' and d.get('topic')}
-                    self.kafka_transport.ensure_topics(topics)
-                except Exception as e:
-                    logger.error(f"Failed to initialize Kafka transport: {e}")
-                    self.kafka_transport = None
-                    return None
+                logger.error("Kafka transport requested but not initialized.")
             return self.kafka_transport
         if mode == 'http':
             dir_id = directory['id']
@@ -83,8 +86,7 @@ class FileProducer(threading.Thread):
                     f"File producer encountered an error. Retrying in {KAFKA_CONN_RETRY_INTERVAL_SECONDS} seconds...; error: {e}"
                 )
                 self._wait_before_retry()
-            finally:
-                self._stop_transports()
+        self._stop_transports()
 
     def produce_messages(self) -> None:
         logger.info("Starting to watch directories.")
@@ -150,12 +152,8 @@ class FileProducer(threading.Thread):
                 return
 
             file_bytes = prepared.message.content
-            is_http = isinstance(transport, HttpTransport)
-            max_transport_size = transport.max_transfer_size() or len(file_bytes)
-            if is_http:
-                base_chunk_size = len(file_bytes)
-            else:
-                base_chunk_size = min(self.chunk_size, max_transport_size, int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
+            max_transport_size = transport.max_transfer_size() or self.chunk_size
+            base_chunk_size = min(self.chunk_size, max_transport_size, int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
             chunk_size = max(1, base_chunk_size)
             total_chunks = max(1, (len(file_bytes) + chunk_size - 1) // chunk_size)
             file_id = f"{prepared.message.file_name}-{uuid.uuid4().hex}"

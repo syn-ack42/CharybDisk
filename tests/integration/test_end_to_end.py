@@ -16,10 +16,10 @@ import pytest
 import requests
 from kafka import KafkaAdminClient
 
-
 RUN_INTEGRATION = os.environ.get("RUN_INTEGRATION") == "1"
 HTTP_COMPOSE_DIR = Path("tools/http-test-server")
 KAFKA_COMPOSE_DIR = Path("tools/kafka-test")
+
 
 
 pytestmark = pytest.mark.skipif(
@@ -27,24 +27,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _run(cmd, cwd=None):
-    print(f"[integration] run: {' '.join(cmd)} cwd={cwd}")
-    subprocess.run(cmd, cwd=cwd, check=True)
-
-
-def _compose_up(path: Path):
-    _run(["docker", "compose", "up", "-d", "--remove-orphans"], cwd=path)
-
-
-def _compose_down(path: Path):
-    _run(["docker", "compose", "down", "--remove-orphans"], cwd=path)
-
+# ----------------------------------------------------------------------
+# EXTENDED DEBUG HELPERS
+# ----------------------------------------------------------------------
 
 def _dump_tree(path: Path) -> str:
-    out = []
     if not path.exists():
-        return f"<dir does not exist: {path}>"
-
+        return f"<directory {path} does not exist>"
+    out = []
     for root, dirs, files in os.walk(path):
         root_path = Path(root)
         rel = root_path.relative_to(path)
@@ -64,6 +54,39 @@ def _dump_threads() -> str:
             f"Thread(name={t.name!r}, alive={t.is_alive()}, daemon={t.daemon})"
         )
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# CORE HELPERS
+# ----------------------------------------------------------------------
+
+def _run(cmd, cwd=None):
+    print(f"[integration] run: {' '.join(cmd)} cwd={cwd}")
+    subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def _compose_up(path: Path):
+    _run(["docker", "compose", "up", "-d", "--remove-orphans"], cwd=path)
+
+
+def _compose_down(path: Path):
+    _run(["docker", "compose", "down", "--remove-orphans"], cwd=path)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def services():
+    _compose_up(HTTP_COMPOSE_DIR)
+    _compose_up(KAFKA_COMPOSE_DIR)
+    print("[integration] waiting for HTTP test server health...")
+    if not _wait_for_http_health("http://localhost:8080/health", timeout=60):
+        pytest.fail("HTTP test server not reachable")
+    print("[integration] waiting for Kafka broker...")
+    ok, reason = _wait_for_kafka("127.0.0.1:29092", timeout=60)
+    if not ok:
+        pytest.fail(f"Kafka test broker not reachable: {reason}")
+    yield
+    _compose_down(HTTP_COMPOSE_DIR)
+    _compose_down(KAFKA_COMPOSE_DIR)
 
 
 def _rand_name(prefix="file", ext="bin"):
@@ -186,6 +209,10 @@ consumer:
     return cfg_path, upload_http, download_http, upload_kafka, download_kafka, error_http, error_kafka
 
 
+# ----------------------------------------------------------------------
+# APP PROCESS FIXTURE
+# ----------------------------------------------------------------------
+
 @pytest.fixture()
 def app_process(tmp_path_factory):
     tmpdir = tmp_path_factory.mktemp("integration")
@@ -198,18 +225,27 @@ def app_process(tmp_path_factory):
     logs_dir = Path("integration_logs")
     logs_dir.mkdir(exist_ok=True)
     log_file = logs_dir / f"app_stdout_{uuid.uuid4().hex}.log"
-    log_fh = open(log_file, "wb")
+    log_fh = open(log_file, "w", buffering=1)
 
     env = os.environ.copy()
     src_path = str(Path(__file__).resolve().parents[2] / "src")
     env["PYTHONPATH"] = src_path + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONFAULTHANDLER"] = "1"
+    env["PYTHONDEVMODE"] = "1"
+
+
+    # wait until Kafka is really ready
+    ok, reason = _wait_for_kafka("127.0.0.1:29092", timeout=60)
+    if not ok:
+        pytest.fail("Kafka broker not ready")
 
     print("START CHARYBDISK")
     proc = subprocess.Popen(
-        ["python", "-u", "-m", "charybdisk", "--config", str(cfg)],
+        ["python", "-X", "faulthandler", "-u", "-m", "charybdisk", "--config", str(cfg)],
         stdout=log_fh,
         stderr=subprocess.STDOUT,
+        text=True,
         bufsize=1,
         env=env,
     )
@@ -217,23 +253,42 @@ def app_process(tmp_path_factory):
 
     time.sleep(3)
 
-    # Early check for crashed watcher threads
-    thread_dump = _dump_threads()
-    print("EARLY THREAD STATE:\n" + thread_dump)
+    # -----------------------------------------------------------
+    # EXTENDED DEBUG: CONFIG + DIRECTORY STRUCTURES + THREADS
+    # -----------------------------------------------------------
+    print("\n=== DEBUG: CONFIG CONTENT ===")
+    try:
+        print(Path(cfg).read_text())
+    except Exception as e:
+        print("FAILED TO READ CONFIG:", e)
+
+    print("\n=== DEBUG: WATCHED DIRECTORIES ===")
+    dirs = {
+        "upload_http": upload_http,
+        "download_http": download_http,
+        "upload_kafka": upload_kafka,
+        "download_kafka": download_kafka,
+        "error_http": error_http,
+        "error_kafka": error_kafka,
+    }
+    for name, p in dirs.items():
+        print(f"{name}: exists={p.exists()} path={p}")
+        if p.exists():
+            try:
+                print(" contents:", list(p.iterdir()))
+            except Exception as e:
+                print(" error listing:", e)
+
+    print("\n=== DEBUG: EARLY THREAD DUMP ===")
+    print(_dump_threads())
+    print("=== END DEBUG ===\n")
 
     integ_log = Path(cfg).with_name("integration.log")
 
     yield {
         "proc": proc,
         "cfg": cfg,
-        "dirs": {
-            "upload_http": upload_http,
-            "download_http": download_http,
-            "upload_kafka": upload_kafka,
-            "download_kafka": download_kafka,
-            "error_http": error_http,
-            "error_kafka": error_kafka,
-        },
+        "dirs": dirs,
         "log_file": log_file,
         "integration_log": integ_log,
     }
@@ -252,6 +307,10 @@ def app_process(tmp_path_factory):
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ----------------------------------------------------------------------
+# MAIN TEST
+# ----------------------------------------------------------------------
+
 def test_end_to_end_http_and_kafka(app_process):
     dirs = app_process["dirs"]
     proc = app_process["proc"]
@@ -260,12 +319,15 @@ def test_end_to_end_http_and_kafka(app_process):
         log_tail = Path(app_process["log_file"]).read_text().splitlines()[-200:]
         pytest.fail("App exited before test start:\n" + "\n".join(log_tail))
 
+    # HTTP success
     small_http = dirs["upload_http"] / _rand_name("http_small", "txt")
     _write_random_file(small_http, 1024)
 
+    # Kafka success
     large_kafka = dirs["upload_kafka"] / _rand_name("kafka_large", "bin")
     _write_random_file(large_kafka, 800_000)
 
+    # HTTP failure
     bad_http = dirs["error_http"] / _rand_name("http_bad", "txt")
     _write_random_file(bad_http, 2048)
 
@@ -292,24 +354,31 @@ def test_end_to_end_http_and_kafka(app_process):
             except Exception:
                 integ_tail = ["<unable to read integration log>"]
 
-        http_up = _dump_tree(dirs["upload_http"])
-        http_dl = _dump_tree(dirs["download_http"])
-        http_err = _dump_tree(dirs["error_http"])
         threads = _dump_threads()
+        up_tree = _dump_tree(dirs["upload_http"])
+        dl_tree = _dump_tree(dirs["download_http"])
+        err_tree = _dump_tree(dirs["error_http"])
 
         pytest.fail(
             "HTTP file not received.\n\n"
             "==== THREADS ====\n" + threads + "\n\n"
-            "==== UPLOAD_HTTP TREE ====\n" + http_up + "\n\n"
-            "==== DOWNLOAD_HTTP TREE ====\n" + http_dl + "\n\n"
-            "==== ERROR_HTTP TREE ====\n" + http_err + "\n\n"
+            "==== UPLOAD_HTTP TREE ====\n" + up_tree + "\n\n"
+            "==== DOWNLOAD_HTTP TREE ====\n" + dl_tree + "\n\n"
+            "==== ERROR_HTTP TREE ====\n" + err_tree + "\n\n"
             "==== STDOUT LOG (tail) ====\n" + "\n".join(log_tail) + "\n\n"
             "==== INTEGRATION LOG (tail) ====\n" + "\n".join(integ_tail)
         )
 
+    # Kafka path
     assert _wait_for_file(dirs["download_kafka"] / large_kafka.name, timeout=40)
+
+    # HTTP failure path
     assert _wait_for_file(dirs["error_http"] / "error" / bad_http.name, timeout=40)
 
+
+# ----------------------------------------------------------------------
+# LOAD TEST WITH RESTARTS
+# ----------------------------------------------------------------------
 
 def test_under_load_with_restarts(app_process):
     dirs = app_process["dirs"]
@@ -330,10 +399,10 @@ def test_under_load_with_restarts(app_process):
                 ["python", "-u", "-m", "charybdisk", "--config", str(app_process["proc"].args[-1])],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                bufsize=1,
+                bufsize=1, text=True,
             )
 
-    t = threading.Thread(target=restarter, args=(app_process["proc"],), daemon=True)
+    t = threading.Thread(target=restarter, args=(app_process["proc"],), daemon=False)
     t.start()
 
     while time.time() < end_time:

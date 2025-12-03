@@ -1,3 +1,6 @@
+import faulthandler
+faulthandler.enable(all_threads=True)
+
 import argparse
 import sys
 
