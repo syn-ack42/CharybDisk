@@ -42,21 +42,18 @@ class FileProducer(threading.Thread):
         self.max_message_bytes = producer_config.get('max_message_bytes') or kafka_config.get('max_message_bytes') or DEFAULT_MAX_MESSAGE_BYTES
         self.chunk_size = producer_config.get('chunk_size_bytes', int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
 
-        self._init_kafka_transport_if_needed()
-
-    def _init_kafka_transport_if_needed(self) -> None:
-        kafka_dirs = [d for d in self.directories if d.get('transport') == 'kafka']
-        if not kafka_dirs:
-            return
-        self.kafka_transport = KafkaTransport(self.kafka_config)
-        topics = {d['topic']: d for d in kafka_dirs if d.get('topic')}
-        self.kafka_transport.ensure_topics(topics)
-
     def _get_transport_for_directory(self, directory: Dict[str, Any]) -> Optional[Transport]:
         mode = directory.get('transport')
         if mode == 'kafka':
             if self.kafka_transport is None:
-                logger.error("Kafka transport requested but not initialized.")
+                try:
+                    self.kafka_transport = KafkaTransport(self.kafka_config)
+                    topics = {d['topic']: d for d in self.directories if d.get('transport') == 'kafka' and d.get('topic')}
+                    self.kafka_transport.ensure_topics(topics)
+                except Exception as e:
+                    logger.error(f"Failed to initialize Kafka transport: {e}")
+                    self.kafka_transport = None
+                    return None
             return self.kafka_transport
         if mode == 'http':
             dir_id = directory['id']

@@ -22,3 +22,8 @@ Unified producer/consumer that watches directories, sends files via transports (
 - HTTP extras: under `producer.http`/`consumer.http` you can set `default_headers`, `timeout`, `poll_interval` (consumer), and optional `max_transfer_file_size` for HTTP sends (unset means no cap).
 
 See `config.example.yaml` for a complete template using the legacy directories/topics plus sample HTTP entries.
+
+## Testing
+- Unit tests: `pytest`
+- Integration tests (require Docker, http/kafka test stacks): `RUN_INTEGRATION=1 pytest tests/integration/test_end_to_end.py -v`
+  - Defaults: runtime 60s, restart every 20s; override via `INTEGRATION_RUNTIME` and `INTEGRATION_RESTART_EVERY`.

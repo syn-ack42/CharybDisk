@@ -120,6 +120,13 @@ def register_endpoints(app: Flask, config: Dict) -> None:
         def upload(ep=ep, save_dir=save_dir):
             content: Optional[bytes] = None
             file_name: Optional[str] = request.headers.get("X-File-Name")
+            original_b64 = request.headers.get("X-Original-File-Name-B64")
+            if original_b64:
+                try:
+                    original_name = base64.b64decode(original_b64).decode("utf-8")
+                    file_name = original_name
+                except Exception:
+                    pass
 
             if request.files:
                 # Accept first file from multipart form data
@@ -167,8 +174,12 @@ def register_endpoints(app: Flask, config: Dict) -> None:
             file_name = file_path.name
             create_ts = ep.get("create_timestamp_header_value", "")
 
+            safe_name = file_name.encode('utf-8', errors='ignore').decode('ascii', errors='ignore')
+            if not safe_name:
+                safe_name = "file.bin"
             resp = make_response(send_file(str(file_path), as_attachment=True, download_name=file_name))
-            resp.headers["X-File-Name"] = file_name
+            resp.headers["X-File-Name"] = safe_name
+            resp.headers["X-Original-File-Name-B64"] = base64.b64encode(file_name.encode("utf-8")).decode("ascii")
             resp.headers["X-Create-Timestamp"] = create_ts
 
             with open(file_path, "rb") as f:

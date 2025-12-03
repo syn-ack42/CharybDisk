@@ -1,3 +1,4 @@
+import base64
 import logging
 import threading
 from typing import Any, Dict, Optional
@@ -12,13 +13,33 @@ logger = logging.getLogger('charybdisk.transport.http')
 
 
 def _build_headers(message: FileMessage, extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    safe_name, changed = sanitize_header_filename(message.file_name)
+    if changed:
+        logger.warning(f"Non-ASCII characters in file name '{message.file_name}' were replaced for HTTP headers as '{safe_name}'")
+
     headers = {
-        'X-File-Name': message.file_name,
+        'X-File-Name': safe_name,
         'X-Create-Timestamp': message.create_timestamp,
+        'X-Original-File-Name-B64': base64.b64encode(message.file_name.encode('utf-8')).decode('ascii'),
     }
     if extra_headers:
         headers.update(extra_headers)
     return headers
+
+
+def sanitize_header_filename(name: str) -> (str, bool):
+    """
+    HTTP headers must be ASCII. Replace any non-ASCII characters with U+XXXX notation.
+    """
+    changed = False
+    out_chars = []
+    for ch in name:
+        if ord(ch) < 128:
+            out_chars.append(ch)
+        else:
+            out_chars.append(f"U+{ord(ch):04X}")
+            changed = True
+    return "".join(out_chars), changed
 
 
 class HttpTransport(Transport):
@@ -78,7 +99,14 @@ class HttpPoller(Receiver, threading.Thread):
                         break
                     if resp.ok:
                         fetched_any = True
-                        file_name = resp.headers.get('X-File-Name', 'file.bin')
+                        original_b64 = resp.headers.get('X-Original-File-Name-B64')
+                        if original_b64:
+                            try:
+                                file_name = base64.b64decode(original_b64).decode('utf-8')
+                            except Exception:
+                                file_name = resp.headers.get('X-File-Name', 'file.bin')
+                        else:
+                            file_name = resp.headers.get('X-File-Name', 'file.bin')
                         create_timestamp = resp.headers.get('X-Create-Timestamp', '')
                         content = resp.content
                         self.on_message(
