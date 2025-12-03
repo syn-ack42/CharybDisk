@@ -8,9 +8,9 @@ Unified producer/consumer that watches directories, sends files via transports (
 - Copy `config.example.yaml` to your own config and adjust paths/topics/logging.
 
 ## Running
-```
-python main.py --config path/to/your_config.yaml
-```
+- Install deps (or use a venv): `pip install -r requirements.txt`
+- Run via module (preferred): `python -m charybdisk --config path/to/your_config.yaml`
+- Or use the thin wrapper: `python main.py --config path/to/your_config.yaml`
 - Toggle roles via config: set `producer.enabled` and/or `consumer.enabled`. Each producer directory and consumer topic explicitly declares `transport: kafka` or `transport: http`.
 - Logging goes to console and optional file (no Kafka log sink).
 

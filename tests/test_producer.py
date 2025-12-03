@@ -53,7 +53,7 @@ def test_process_file_deletes_when_no_backup():
         file_path = Path(tmpdir) / "test.txt"
         file_path.write_text("hello world")
 
-        producer.process_file(str(file_path), "http://example.com/upload", "cfg", None, dummy_transport)
+        producer.process_file(str(file_path), "http://example.com/upload", "cfg", None, dummy_transport, None)
 
         assert not file_path.exists(), "File should be removed when no backup directory is configured"
         assert dummy_transport.sent, "Transport should have been called"
@@ -67,7 +67,7 @@ def test_process_file_moves_to_backup():
         src_file.write_text("content")
 
         backup_dir = Path(tmpdir) / "backup"
-        producer.process_file(str(src_file), "http://example.com/upload", "cfg", str(backup_dir), dummy_transport)
+        producer.process_file(str(src_file), "http://example.com/upload", "cfg", str(backup_dir), dummy_transport, None)
 
         assert not src_file.exists(), "Source file should be moved out of original directory"
         moved_files = list(backup_dir.glob("*"))
@@ -82,7 +82,7 @@ def test_process_file_respects_failed_transport():
         src_file = Path(tmpdir) / "test3.txt"
         src_file.write_text("content")
 
-        producer.process_file(str(src_file), "http://example.com/upload", "cfg", None, dummy_transport)
+        producer.process_file(str(src_file), "http://example.com/upload", "cfg", None, dummy_transport, None)
 
         # On failure, original file should remain and no deletion should occur
         assert src_file.exists()
