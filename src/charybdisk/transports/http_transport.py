@@ -56,11 +56,31 @@ class HttpTransport(Transport):
         url = destination
         headers = _build_headers(message, self.extra_headers)
         try:
-            resp = self.session.post(url, headers=headers, data=message.content, timeout=self.http_config.get('timeout', 30))
+            content_len = len(message.content)
+            logger.info(
+                "HTTP send -> %s (%s bytes, file_id=%s chunk=%s/%s)",
+                url,
+                content_len,
+                message.file_id,
+                message.chunk_index,
+                message.total_chunks,
+            )
+            resp = self.session.post(
+                url,
+                headers=headers,
+                data=message.content,
+                timeout=self.http_config.get('timeout', 30),
+            )
+            logger.info(
+                "HTTP send response <- %s status=%s",
+                url,
+                resp.status_code,
+            )
             if resp.ok:
                 return SendResult(True)
             return SendResult(False, Exception(f"HTTP {resp.status_code}: {resp.text}"))
         except Exception as e:
+            logger.error("HTTP send failed for %s: %s", url, e)
             return SendResult(False, e)
 
     def stop(self) -> None:
@@ -94,8 +114,12 @@ class HttpPoller(Receiver, threading.Thread):
             fetched_any = False
             try:
                 while not self._stopped.is_set():
+                    logger.info("HTTP poll -> %s", self.url)
                     resp = self.session.get(self.url, headers=self.extra_headers, timeout=timeout)
+                    resp_len = len(resp.content or b"")
+                    logger.info("HTTP poll <- %s status=%s bytes=%s", self.url, resp.status_code, resp_len)
                     if resp.status_code == 204 or not resp.content:
+                        logger.info("HTTP poll %s returned no content (status=%s)", self.url, resp.status_code)
                         break
                     if resp.ok:
                         fetched_any = True
@@ -109,6 +133,12 @@ class HttpPoller(Receiver, threading.Thread):
                             file_name = resp.headers.get('X-File-Name', 'file.bin')
                         create_timestamp = resp.headers.get('X-Create-Timestamp', '')
                         content = resp.content
+                        logger.info(
+                            "HTTP poll <- %s delivered file '%s' (%s bytes)",
+                            self.url,
+                            file_name,
+                            len(content),
+                        )
                         self.on_message(
                             FileMessage(
                                 file_name=file_name,

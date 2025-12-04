@@ -1,7 +1,6 @@
 upload_endpoints:
   - path: /upload
     save_dir: /data/upload
-    done_dir: /data/upload/done
     auth:
       type: basic
       username: user

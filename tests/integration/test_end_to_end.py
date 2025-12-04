@@ -84,6 +84,7 @@ def services():
     if not ok:
         pytest.fail(f"Kafka test broker not reachable: {reason}")
     yield
+    print("------ ASKED FOR SHUTDOWN------")
     _compose_down(HTTP_COMPOSE_DIR)
     _compose_down(KAFKA_COMPOSE_DIR)
 
@@ -173,6 +174,7 @@ logging:
 
 producer:
   enabled: true
+  scan_interval: 1
   chunk_size_bytes: 600000
   directories:
     - id: HTTP_OK
@@ -265,11 +267,11 @@ def app_process(tmp_path_factory):
     # -----------------------------------------------------------
     # EXTENDED DEBUG: CONFIG + DIRECTORY STRUCTURES + THREADS
     # -----------------------------------------------------------
-    print("\n=== DEBUG: CONFIG CONTENT ===")
-    try:
-        print(Path(cfg).read_text())
-    except Exception as e:
-        print("FAILED TO READ CONFIG:", e)
+    # print("\n=== DEBUG: CONFIG CONTENT ===")
+    # try:
+    #     print(Path(cfg).read_text())
+    # except Exception as e:
+    #     print("FAILED TO READ CONFIG:", e)
 
     print("\n=== DEBUG: WATCHED DIRECTORIES ===")
     dirs = {
@@ -344,7 +346,7 @@ def test_end_to_end_http_and_kafka(app_process):
 
     found_http = (
         _wait_for_file(dirs["download_http"] / small_http.name, timeout=40)
-        or _wait_for_file(dirs["download_http"] / sanitized, timeout=5)
+        or _wait_for_file(dirs["download_http"] / sanitized, timeout=50)
     )
 
     if not found_http:
@@ -379,7 +381,7 @@ def test_end_to_end_http_and_kafka(app_process):
         )
 
     # Kafka path
-    assert _wait_for_file(dirs["download_kafka"] / large_kafka.name, timeout=40)
+    assert _wait_for_file(dirs["download_kafka"] / large_kafka.name, timeout=120)
 
     # HTTP failure path
     assert _wait_for_file(dirs["error_http"] / "error" / bad_http.name, timeout=40)

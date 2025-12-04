@@ -128,6 +128,8 @@ class FileProducer(threading.Thread):
 
         files = glob.glob(os.path.join(directory_path, file_pattern))
         files = [f for f in files if os.path.isfile(f)]
+        if files:
+            logger.info("Found %d file(s) in '%s' for destination '%s'.", len(files), directory_path, destination)
         for file_path in files:
             if self.stop_event.is_set():
                 break
@@ -159,23 +161,30 @@ class FileProducer(threading.Thread):
             file_id = f"{prepared.message.file_name}-{uuid.uuid4().hex}"
             all_sent = True
 
-            for idx in range(total_chunks):
-                start = idx * chunk_size
-                end = start + chunk_size
-                chunk = file_bytes[start:end]
-                chunk_msg = FileMessage(
-                    file_name=prepared.message.file_name,
-                    create_timestamp=prepared.message.create_timestamp,
-                    content=chunk,
-                    file_id=file_id,
-                    chunk_index=idx,
-                    total_chunks=total_chunks,
-                    original_size=len(file_bytes),
-                )
-                result: SendResult = transport.send(destination, chunk_msg)
+            # HTTP transports should not be chunked; send the prepared message once.
+            if isinstance(transport, HttpTransport):
+                result: SendResult = transport.send(destination, prepared.message)
                 if not result.success:
                     all_sent = False
-                    raise result.error or Exception("Unknown transport send error")
+                    raise result.error or Exception("HTTP transport send error")
+            else:
+                for idx in range(total_chunks):
+                    start = idx * chunk_size
+                    end = start + chunk_size
+                    chunk = file_bytes[start:end]
+                    chunk_msg = FileMessage(
+                        file_name=prepared.message.file_name,
+                        create_timestamp=prepared.message.create_timestamp,
+                        content=chunk,
+                        file_id=file_id,
+                        chunk_index=idx,
+                        total_chunks=total_chunks,
+                        original_size=len(file_bytes),
+                    )
+                    result: SendResult = transport.send(destination, chunk_msg)
+                    if not result.success:
+                        all_sent = False
+                        raise result.error or Exception("Unknown transport send error")
 
             if all_sent:
                 logger.info(
