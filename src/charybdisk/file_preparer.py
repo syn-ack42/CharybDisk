@@ -23,14 +23,16 @@ class PreparedFile:
 
 def remove_text_between_T_and_extension(file_name: str) -> str:
     name, ext = os.path.splitext(file_name)
-    pattern = r'_T\d{17}'  # Match "_T" followed by exactly 17 digits
+    pattern = r'_T\d+'  # Match "_T" followed by digits (timestamp suffixes)
     new_name = re.sub(pattern, '', name) + ext
     return new_name
 
 
 def build_backup_name(file_path: str, create_timestamp: str) -> str:
     no_ts_fname = remove_text_between_T_and_extension(file_path)
-    return f"{os.path.splitext(os.path.basename(no_ts_fname))[0]}_T{create_timestamp}{os.path.splitext(no_ts_fname)[1]}"
+    safe_timestamp = re.sub(r'[^0-9]', '', create_timestamp) or datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    base, ext = os.path.splitext(os.path.basename(no_ts_fname))
+    return f"{base}_T{safe_timestamp}{ext}"
 
 
 class FilePreparer:
@@ -94,9 +96,10 @@ class FilePreparer:
 
 def backup_file(file_path: str, backup_directory: str, new_file_name: str) -> None:
     try:
+        safe_file_name = re.sub(r'[<>:\"/\\\\|?*]', '_', new_file_name).rstrip('. ')
         if not os.path.exists(backup_directory):
             os.makedirs(backup_directory)
-        shutil.move(file_path, os.path.join(backup_directory, new_file_name))
+        shutil.move(file_path, os.path.join(backup_directory, safe_file_name))
         logger.info(f"Moved file '{os.path.basename(file_path)}' to backup directory: '{backup_directory}'")
     except Exception as e:
         logger.error(f"Error moving file '{file_path}' to backup directory '{backup_directory}': {e}")

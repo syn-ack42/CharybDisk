@@ -9,12 +9,11 @@ import threading
 import time
 import uuid
 from pathlib import Path
-
-from charybdisk.transports.http_transport import sanitize_header_filename
-
 import pytest
 import requests
 from kafka import KafkaAdminClient
+
+from charybdisk.transports.http_transport import sanitize_header_filename
 
 RUN_INTEGRATION = os.environ.get("RUN_INTEGRATION") == "1"
 HTTP_COMPOSE_DIR = Path("tools/http-test-server")
@@ -145,11 +144,21 @@ def _make_config(tmpdir: Path) -> Path:
     error_http = tmpdir / "http_error"
     error_kafka = tmpdir / "kafka_error"
     parts_dir = tmpdir / "parts"
+    log_file = tmpdir / "integration.log"
 
     for p in [upload_http, download_http, upload_kafka, download_kafka, error_http, error_kafka, parts_dir]:
         p.mkdir(parents=True, exist_ok=True)
 
     basic = base64.b64encode(b"user:pass").decode()
+    upload_http_s = upload_http.as_posix()
+    download_http_s = download_http.as_posix()
+    upload_kafka_s = upload_kafka.as_posix()
+    download_kafka_s = download_kafka.as_posix()
+    error_http_s = error_http.as_posix()
+    error_kafka_s = error_kafka.as_posix()
+    parts_dir_s = parts_dir.as_posix()
+    log_file_s = log_file.as_posix()
+
     config = f"""
 kafka:
   broker: 127.0.0.1:29092
@@ -160,7 +169,7 @@ kafka:
 logging:
   console_log_level: info
   file_log_level: debug
-  log_file: {tmpdir}/integration.log
+  log_file: "{log_file_s}"
 
 producer:
   enabled: true
@@ -168,22 +177,22 @@ producer:
   directories:
     - id: HTTP_OK
       transport: http
-      path: "{upload_http}"
-      backup_directory: "{upload_http}/done"
+      path: "{upload_http_s}"
+      backup_directory: "{upload_http_s}/done"
       file_pattern: "*"
       destination: "http://localhost:8080/upload"
       headers:
         Authorization: "Basic {basic}"
     - id: HTTP_BAD
       transport: http
-      path: "{error_http}"
-      error_directory: "{error_http}/error"
+      path: "{error_http_s}"
+      error_directory: "{error_http_s}/error"
       destination: "http://localhost:8081/bad"
     - id: KAFKA_OK
       transport: kafka
-      path: "{upload_kafka}"
-      backup_directory: "{upload_kafka}/done"
-      error_directory: "{error_kafka}"
+      path: "{upload_kafka_s}"
+      backup_directory: "{upload_kafka_s}/done"
+      error_directory: "{error_kafka_s}"
       file_pattern: "*"
       topic: "charybdisk.test.files"
 
@@ -194,15 +203,15 @@ consumer:
     timeout: 10
     default_headers:
       Authorization: "Bearer secret-token"
-  working_directory: "{parts_dir}"
+  working_directory: "{parts_dir_s}"
   start_from_end: false
   topics:
     - transport: http
       url: "http://localhost:8080/download"
-      output_directory: "{download_http}"
+      output_directory: "{download_http_s}"
     - transport: kafka
       topic: "charybdisk.test.files"
-      output_directory: "{download_kafka}"
+      output_directory: "{download_kafka_s}"
 """
     cfg_path = tmpdir / "config.yaml"
     cfg_path.write_text(config)

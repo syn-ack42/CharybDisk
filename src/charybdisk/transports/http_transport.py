@@ -75,7 +75,7 @@ class HttpPoller(Receiver, threading.Thread):
         on_message,
         headers: Optional[Dict[str, str]] = None,
     ) -> None:
-        threading.Thread.__init__(self, daemon=False)
+        threading.Thread.__init__(self, daemon=True)
         self.http_config = http_config
         self.url = url
         self.on_message = on_message

@@ -76,7 +76,7 @@ class KafkaReceiver(Receiver, threading.Thread):
         start_from_end: bool,
         on_message: Callable[[FileMessage], None],
     ) -> None:
-        threading.Thread.__init__(self, daemon=False)
+        threading.Thread.__init__(self, daemon=True)
         self.kafka_config = kafka_config
         self.topic = topic
         self.group_id = group_id or kafka_config.get('default_group_id', 'default_group')
@@ -96,18 +96,35 @@ class KafkaReceiver(Receiver, threading.Thread):
         logger.info(f'Kafka receiver created for topic {self.topic}, group {self.group_id}')
 
     def run(self) -> None:
-        for message in self.consumer:
-            if self.stop_event.is_set():
-                break
+        try:
+            while not self.stop_event.is_set():
+                records = self.consumer.poll(timeout_ms=1000)
+                if not records:
+                    continue
+                for topic_partition, batch in records.items():
+                    for message in batch:
+                        try:
+                            file_message = decode_message(message.value)
+                            self.on_message(file_message)
+                        except Exception as e:
+                            logger.error(f"Failed to handle Kafka message from topic {self.topic}: {e}")
+        except Exception as e:
+            # When stopping, the consumer.poll loop can be interrupted; only warn if unexpected
+            if not self.stop_event.is_set():
+                logger.error(f"Kafka receiver loop failed for topic {self.topic}: {e}")
+        finally:
             try:
-                file_message = decode_message(message.value)
-                self.on_message(file_message)
+                self.consumer.close()
             except Exception as e:
-                logger.error(f"Failed to handle Kafka message from topic {self.topic}: {e}")
+                logger.debug(f"Kafka consumer close raised: {e}")
 
     def start(self) -> None:  # type: ignore[override]
         threading.Thread.start(self)
 
     def stop(self) -> None:
         self.stop_event.set()
-        self.consumer.close()
+        try:
+            # Wake up the poll loop so it can exit promptly
+            self.consumer.wakeup()
+        except Exception:
+            pass
