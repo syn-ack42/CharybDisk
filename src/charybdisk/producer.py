@@ -29,7 +29,7 @@ class FileProducer(threading.Thread):
     """
 
     def __init__(self, producer_config: Dict[str, Any], kafka_config: Dict[str, Any]) -> None:
-        super().__init__(daemon=False)
+        super().__init__(daemon=True)
         self.producer_config = producer_config
         self.kafka_config = kafka_config
         self.stop_event = threading.Event()

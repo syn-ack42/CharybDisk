@@ -19,7 +19,7 @@ class FileConsumerGroup(threading.Thread):
     """
 
     def __init__(self, consumer_config: Dict[str, Any], kafka_config: Dict[str, Any]) -> None:
-        super().__init__(daemon=False)
+        super().__init__(daemon=True)
         self.consumer_config = consumer_config
         self.kafka_config = kafka_config
         self.receivers: List[threading.Thread] = []
