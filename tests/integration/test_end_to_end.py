@@ -393,8 +393,8 @@ def test_end_to_end_http_and_kafka(app_process):
 
 def test_under_load_with_restarts(app_process):
     dirs = app_process["dirs"]
-    runtime = int(os.environ.get("INTEGRATION_RUNTIME", "60"))
-    restart_every = int(os.environ.get("INTEGRATION_RESTART_EVERY", "20"))
+    runtime = int(os.environ.get("INTEGRATION_RUNTIME", "300"))
+    restart_every = int(os.environ.get("INTEGRATION_RESTART_EVERY", "30"))
     end_time = time.time() + runtime
 
     def restarter(proc):
