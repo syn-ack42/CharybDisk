@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX v4 installer template for CharybDisk + WinSW wrapper.
+  Prereqs:
+    - Build charybdisk.exe with PyInstaller (dist\charybdisk.exe).
+    - Download WinSW (x64) and rename to charybdisk-service.exe.
+    - Copy your WinSW XML (renamed to charybdisk-service.xml) alongside the exe.
+    - Place all payloads into a build folder and pass it as BuildOutput when building.
+  Build (from repo root, with WiX v4 on PATH):
+    wix build -dBuildOutput="C:\path\to\build" tools/windows/charybdisk.wxs
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="CharybDisk"
+           Manufacturer="Your Company"
+           Language="1033"
+           Version="1.0.0.0"
+           UpgradeCode="7C2D8A87-6C0B-4F4B-9B3D-9E4C0A5B8E80"
+           InstallerVersion="500"
+           Compressed="yes"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of CharybDisk is already installed." />
+    <MediaTemplate />
+
+    <Property Id="INSTALLFOLDER" Value="[#INSTALLDIR]" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLDIR" Name="CharybDisk">
+          <Component Id="CharybDiskExe" Guid="B06C7B78-3C5E-4E58-8B8E-2F3CC6D3C3E1">
+            <File Id="CharybDiskExeFile" Name="charybdisk.exe" Source="$(var.BuildOutput)\charybdisk.exe" />
+          </Component>
+          <Component Id="WinSWExe" Guid="63E5A6B5-5FB2-4BE8-8684-94A4F65A9541">
+            <File Id="WinSWExeFile" Name="charybdisk-service.exe" Source="$(var.BuildOutput)\charybdisk-service.exe" />
+          </Component>
+          <Component Id="WinSWConfig" Guid="F4B70280-65C3-4A2E-B218-2D4602D6BBA0">
+            <File Id="WinSWConfigFile" Name="charybdisk-service.xml" Source="$(var.BuildOutput)\charybdisk-service.xml" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="CONFIGDIR" Name="CharybDisk">
+          <Component Id="ConfigSample" Guid="A3D8E0F5-1B6A-4D8A-9B5C-3C61552B76A2">
+            <File Id="ConfigSampleFile" Name="config.example.yaml" Source="$(var.BuildOutput)\config.example.yaml" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="CharybDisk Service" Level="1">
+      <ComponentRef Id="CharybDiskExe" />
+      <ComponentRef Id="WinSWExe" />
+      <ComponentRef Id="WinSWConfig" />
+      <ComponentRef Id="ConfigSample" />
+    </Feature>
+
+    <!-- Install the WinSW service -->
+    <CustomAction Id="InstallService"
+                  FileKey="WinSWExeFile"
+                  ExeCommand="install"
+                  Execute="deferred"
+                  Return="check"
+                  Impersonate="no" />
+
+    <CustomAction Id="UninstallService"
+                  FileKey="WinSWExeFile"
+                  ExeCommand="uninstall"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="no" />
+
+    <InstallExecuteSequence>
+      <Custom Action="InstallService" After="InstallFiles">NOT Installed</Custom>
+      <Custom Action="UninstallService" Before="RemoveFiles">REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

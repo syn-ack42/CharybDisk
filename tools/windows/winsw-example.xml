@@ -1,0 +1,30 @@
+<!--
+  Template for running CharybDisk as a Windows Service using WinSW.
+  Rename both this file and the WinSW binary to the same name, e.g. charybdisk-service.xml/.exe.
+  Update the placeholder paths below before installing.
+-->
+<service>
+  <id>CharybDisk</id>
+  <name>CharybDisk</name>
+  <description>CharybDisk producer/consumer service</description>
+
+  <!-- Path to python.exe or to the PyInstaller-built charybdisk.exe -->
+  <executable>C:\charybdisk\venv\Scripts\python.exe</executable>
+  <arguments>-m charybdisk --config C:\charybdisk\config.yaml</arguments>
+
+  <!-- Working directory should be the folder containing your code/exe -->
+  <workingdirectory>C:\charybdisk</workingdirectory>
+
+  <!-- Environment if needed -->
+  <env name="PYTHONUNBUFFERED" value="1" />
+
+  <!-- Optional stdout/stderr logs -->
+  <logpath>C:\ProgramData\CharybDisk\logs</logpath>
+  <log mode="roll-by-size">
+    <sizeThreshold>10MB</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+
+  <!-- Recover on failure -->
+  <onfailure action="restart" delay="5 sec" />
+</service>
