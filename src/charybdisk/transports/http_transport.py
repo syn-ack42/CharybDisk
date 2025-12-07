@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 
 import requests
 from requests import Session
+from requests.exceptions import ReadTimeout, ConnectTimeout
 
 from charybdisk.messages import FileMessage
 from charybdisk.transports.base import Receiver, SendResult, Transport
@@ -19,8 +20,12 @@ def _build_headers(message: FileMessage, extra_headers: Optional[Dict[str, str]]
 
     headers = {
         'X-File-Name': safe_name,
+        # Some receivers (e.g., NiFi) expect X-Filename; send both for compatibility.
+        'X-Filename': safe_name,
         'X-Create-Timestamp': message.create_timestamp,
         'X-Original-File-Name-B64': base64.b64encode(message.file_name.encode('utf-8')).decode('ascii'),
+        # Avoid keeping the server connection open; NiFi/Jetty can stall on keep-alive.
+        'Connection': 'close',
     }
     if extra_headers:
         headers.update(extra_headers)
@@ -69,16 +74,31 @@ class HttpTransport(Transport):
                 url,
                 headers=headers,
                 data=message.content,
-                timeout=self.http_config.get('timeout', 30),
+                timeout=self.http_config.get('timeout', 300),
+                stream=True,  # Do not wait for full body; headers are enough
             )
-            logger.info(
-                "HTTP send response <- %s status=%s",
+            try:
+                logger.info(
+                    "HTTP send response <- %s status=%s",
+                    url,
+                    resp.status_code,
+                )
+                if resp.ok:
+                    return SendResult(True)
+                return SendResult(False, Exception(f"HTTP {resp.status_code}: {resp.text}"))
+            finally:
+                resp.close()
+        except ReadTimeout as e:
+            logger.warning(
+                "HTTP send read timeout for %s (configured timeout=%s); assuming upload reached server and treating as success: %s",
                 url,
-                resp.status_code,
+                self.http_config.get('timeout'),
+                e,
             )
-            if resp.ok:
-                return SendResult(True)
-            return SendResult(False, Exception(f"HTTP {resp.status_code}: {resp.text}"))
+            return SendResult(True)
+        except ConnectTimeout as e:
+            logger.warning("HTTP send connect timeout for %s (configured timeout=%s): %s", url, self.http_config.get('timeout'), e)
+            return SendResult(False, e)
         except Exception as e:
             logger.error("HTTP send failed for %s: %s", url, e)
             return SendResult(False, e)

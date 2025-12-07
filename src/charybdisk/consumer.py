@@ -4,6 +4,9 @@ from typing import Any, Dict, List, Optional
 import os
 import json
 from pathlib import Path
+import time
+
+from kafka.errors import KafkaError, NoBrokersAvailable
 
 from charybdisk.file_writer import write_file_safe
 from charybdisk.messages import FileMessage
@@ -11,6 +14,7 @@ from charybdisk.transports.http_transport import HttpPoller
 from charybdisk.transports.kafka_transport import KafkaReceiver
 
 logger = logging.getLogger('charybdisk.consumer')
+KAFKA_RETRY_INTERVAL_SECONDS = 60
 
 
 class FileConsumerGroup(threading.Thread):
@@ -25,10 +29,12 @@ class FileConsumerGroup(threading.Thread):
         self.receivers: List[threading.Thread] = []
         self.stop_event = threading.Event()
         self.work_dir = consumer_config.get('working_directory', '/tmp/charybdisk_parts')
+        self.kafka_topics: List[Dict[str, Any]] = []
+        self.kafka_retry_at: float = 0
+        self.default_group_id = kafka_config.get('default_group_id')
+        self.start_from_end = self.consumer_config.get('start_from_end', False)
 
     def run(self) -> None:
-        start_from_end = self.consumer_config.get('start_from_end', False)
-        default_group_id = self.kafka_config.get('default_group_id')
         default_http_cfg = self.consumer_config.get('http', {})
 
         for topic_cfg in self.consumer_config.get('topics', []):
@@ -46,20 +52,49 @@ class FileConsumerGroup(threading.Thread):
                 http_cfg = dict(default_http_cfg)
                 http_cfg.update({k: v for k, v in (topic_cfg.get('http') or {}).items() if k != 'headers'})
                 receiver = HttpPoller(http_cfg, url, on_message, headers=headers)
+                receiver.start()
+                self.receivers.append(receiver)
             else:
-                topic = topic_cfg.get('topic')
-                if not topic:
-                    logger.error("Kafka consumer entry missing 'topic'")
-                    continue
-                group_id = topic_cfg.get('group_id', default_group_id)
-                receiver = KafkaReceiver(self.kafka_config, topic, group_id, start_from_end, on_message)
+                self.kafka_topics.append(topic_cfg)
 
-            receiver.start()
-            self.receivers.append(receiver)
+        self._maybe_start_kafka_receivers()
 
         # Keep thread alive while receivers run
         while not self.stop_event.is_set():
+            self._maybe_start_kafka_receivers()
             self.stop_event.wait(1)
+
+    def _maybe_start_kafka_receivers(self) -> None:
+        if not self.kafka_topics:
+            return
+        if time.time() < self.kafka_retry_at:
+            return
+        remaining_topics: List[Dict[str, Any]] = []
+        for topic_cfg in self.kafka_topics:
+            topic = topic_cfg.get('topic')
+            if not topic:
+                logger.error("Kafka consumer entry missing 'topic'")
+                continue
+            try:
+                on_message = self._build_handler(topic_cfg['output_directory'], topic_cfg.get('output_suffix'))
+                group_id = topic_cfg.get('group_id', self.default_group_id)
+                receiver = KafkaReceiver(self.kafka_config, topic, group_id, self.start_from_end, on_message)
+                receiver.start()
+                self.receivers.append(receiver)
+            except (NoBrokersAvailable, KafkaError) as e:
+                logger.warning(
+                    "Kafka unavailable for topic '%s'; retrying in %s seconds: %s",
+                    topic,
+                    KAFKA_RETRY_INTERVAL_SECONDS,
+                    e,
+                )
+                remaining_topics.append(topic_cfg)
+            except Exception as e:
+                logger.error(f"Failed to start Kafka receiver for topic '{topic}': {e}")
+                remaining_topics.append(topic_cfg)
+        self.kafka_topics = remaining_topics
+        if self.kafka_topics:
+            self.kafka_retry_at = time.time() + KAFKA_RETRY_INTERVAL_SECONDS
 
     def _build_handler(self, output_directory: str, output_suffix: Optional[str]):
         assembler = ChunkAssembler(self.work_dir, output_directory, output_suffix)

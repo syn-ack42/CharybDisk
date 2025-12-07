@@ -4,8 +4,10 @@ import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
+from time import time as now
 
 from kafka.errors import KafkaError, NoBrokersAvailable
+from requests.exceptions import ReadTimeout, ConnectTimeout
 
 from charybdisk.file_preparer import DEFAULT_MAX_TRANSFER_FILE_SIZE, FilePreparer, backup_file
 from charybdisk.messages import FileMessage
@@ -14,7 +16,8 @@ from charybdisk.transports.http_transport import HttpTransport
 from charybdisk.transports.kafka_transport import KafkaTransport
 import uuid
 
-KAFKA_CONN_RETRY_INTERVAL_SECONDS = 5
+KAFKA_CONN_RETRY_INTERVAL_SECONDS = 60
+GENERAL_RETRY_INTERVAL_SECONDS = 5
 DEFAULT_MAX_MESSAGE_BYTES = 1_000_000
 DEFAULT_CHUNK_FRACTION = 0.6  # leave headroom for base64+metadata
 DEFAULT_CHUNK_SIZE = int(DEFAULT_MAX_MESSAGE_BYTES * DEFAULT_CHUNK_FRACTION)
@@ -35,22 +38,41 @@ class FileProducer(threading.Thread):
         self.stop_event = threading.Event()
         self.file_preparer = FilePreparer(max_transfer_file_size=None)  # per-transport limit applied at call time
         self.directories: List[Dict[str, Any]] = producer_config['directories']
+        self.kafka_directories: List[Dict[str, Any]] = [
+            d for d in self.directories if d.get('transport') == 'kafka'
+        ]
         self.scan_interval: int = producer_config.get('scan_interval', 60)
         self.default_http_config = producer_config.get('http', {})
         self.kafka_transport: Optional[KafkaTransport] = None
         self.http_transports: Dict[str, HttpTransport] = {}
         self.max_message_bytes = producer_config.get('max_message_bytes') or kafka_config.get('max_message_bytes') or DEFAULT_MAX_MESSAGE_BYTES
         self.chunk_size = producer_config.get('chunk_size_bytes', int(self.max_message_bytes * DEFAULT_CHUNK_FRACTION))
+        self._kafka_retry_at: float = 0
 
-        self._init_kafka_transport_if_needed()
+        self._init_kafka_transport_if_needed(initial=True)
 
-    def _init_kafka_transport_if_needed(self) -> None:
-        kafka_dirs = [d for d in self.directories if d.get('transport') == 'kafka']
-        if not kafka_dirs:
+    def _init_kafka_transport_if_needed(self, *, initial: bool = False) -> None:
+        if not self.kafka_directories:
             return
-        self.kafka_transport = KafkaTransport(self.kafka_config)
-        topics = {d['topic']: d for d in kafka_dirs if d.get('topic')}
-        self.kafka_transport.ensure_topics(topics)
+        if self.kafka_transport is not None:
+            return
+        if not initial and now() < self._kafka_retry_at:
+            return
+        try:
+            self.kafka_transport = KafkaTransport(self.kafka_config)
+            topics = {d['topic']: d for d in self.kafka_directories if d.get('topic')}
+            self.kafka_transport.ensure_topics(topics)
+            self._kafka_retry_at = 0
+        except (NoBrokersAvailable, KafkaError) as e:
+            logger.warning(
+                "Kafka unavailable during initialization, will retry in %s seconds: %s",
+                KAFKA_CONN_RETRY_INTERVAL_SECONDS,
+                e,
+            )
+            self._schedule_kafka_retry()
+        except Exception as e:
+            logger.error(f"Failed to initialize Kafka transport: {e}")
+            self._schedule_kafka_retry()
 
     def _get_transport_for_directory(self, directory: Dict[str, Any]) -> Optional[Transport]:
         mode = directory.get('transport')
@@ -83,14 +105,15 @@ class FileProducer(threading.Thread):
                 self.produce_messages()
             except Exception as e:
                 logger.error(
-                    f"File producer encountered an error. Retrying in {KAFKA_CONN_RETRY_INTERVAL_SECONDS} seconds...; error: {e}"
+                    f"File producer encountered an error. Retrying in {GENERAL_RETRY_INTERVAL_SECONDS} seconds...; error: {e}"
                 )
-                self._wait_before_retry()
+                self._wait_before_retry(GENERAL_RETRY_INTERVAL_SECONDS)
         self._stop_transports()
 
     def produce_messages(self) -> None:
         logger.info("Starting to watch directories.")
         while not self.stop_event.is_set():
+            self._init_kafka_transport_if_needed()
             for directory in self.directories:
                 if self.stop_event.is_set():
                     break
@@ -208,36 +231,54 @@ class FileProducer(threading.Thread):
                     logger.info(f"Moved file '{file_path}' to error directory '{error_directory}' after send failure.")
                 except Exception as move_err:
                     logger.error(f"Failed to move file '{file_path}' to error directory '{error_directory}': {move_err}")
+            if isinstance(e, (NoBrokersAvailable, KafkaError)):
+                self._handle_kafka_failure(e)
 
     def handle_file_processing_error(self, file_path: str, error: Exception) -> None:
         if isinstance(error, (NoBrokersAvailable, KafkaError)):
             logger.error(f"Transport error occurred while processing file '{file_path}': {error}")
-            raise
+            self._handle_kafka_failure(error)
         else:
             logger.error(f"Error processing file '{file_path}': {error}, continuing")
 
     def handle_directory_processing_error(self, directory: Dict[str, Any], error: Exception) -> None:
         if isinstance(error, (NoBrokersAvailable, KafkaError)):
             logger.error(f"Transport error occurred while processing directory '{directory['path']}': {error}")
-            raise
+            self._handle_kafka_failure(error)
         else:
             logger.error(f"Error processing directory '{directory['path']}': {error}, continuing")
 
-    def _wait_before_retry(self) -> None:
-        self.stop_event.wait(KAFKA_CONN_RETRY_INTERVAL_SECONDS)
+    def _handle_kafka_failure(self, error: Exception) -> None:
+        logger.info(
+            "Marking Kafka transport unavailable; will retry in %s seconds. Reason: %s",
+            KAFKA_CONN_RETRY_INTERVAL_SECONDS,
+            error,
+        )
+        self._schedule_kafka_retry()
+
+    def _schedule_kafka_retry(self) -> None:
+        self._stop_kafka_transport()
+        self.kafka_transport = None
+        self._kafka_retry_at = now() + KAFKA_CONN_RETRY_INTERVAL_SECONDS
+
+    def _wait_before_retry(self, delay_seconds: int) -> None:
+        self.stop_event.wait(delay_seconds)
 
     def stop(self) -> None:
         self.stop_event.set()
         self._stop_transports()
 
     def _stop_transports(self) -> None:
-        if self.kafka_transport:
-            try:
-                self.kafka_transport.stop()
-            except Exception as e:
-                logger.error(f"Error stopping Kafka transport: {e}")
+        self._stop_kafka_transport()
         for transport in self.http_transports.values():
             try:
                 transport.stop()
             except Exception as e:
                 logger.error(f"Error stopping HTTP transport: {e}")
+
+    def _stop_kafka_transport(self) -> None:
+        if self.kafka_transport:
+            try:
+                self.kafka_transport.stop()
+            except Exception as e:
+                logger.error(f"Error stopping Kafka transport: {e}")
