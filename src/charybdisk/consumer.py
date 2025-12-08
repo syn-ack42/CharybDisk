@@ -30,6 +30,7 @@ class FileConsumerGroup(threading.Thread):
         self.stop_event = threading.Event()
         self.work_dir = consumer_config.get('working_directory', '/tmp/charybdisk_parts')
         self.kafka_topics: List[Dict[str, Any]] = []
+        self.kafka_topic_configs: Dict[str, Dict[str, Any]] = {}
         self.kafka_retry_at: float = 0
         self.default_group_id = kafka_config.get('default_group_id')
         self.start_from_end = self.consumer_config.get('start_from_end', False)
@@ -56,11 +57,15 @@ class FileConsumerGroup(threading.Thread):
                 self.receivers.append(receiver)
             else:
                 self.kafka_topics.append(topic_cfg)
+                topic_name = topic_cfg.get('topic')
+                if topic_name:
+                    self.kafka_topic_configs[topic_name] = topic_cfg
 
         self._maybe_start_kafka_receivers()
 
         # Keep thread alive while receivers run
         while not self.stop_event.is_set():
+            self._check_kafka_receiver_health()
             self._maybe_start_kafka_receivers()
             self.stop_event.wait(1)
 
@@ -95,6 +100,29 @@ class FileConsumerGroup(threading.Thread):
         self.kafka_topics = remaining_topics
         if self.kafka_topics:
             self.kafka_retry_at = time.time() + KAFKA_RETRY_INTERVAL_SECONDS
+
+    def _check_kafka_receiver_health(self) -> None:
+        if self.stop_event.is_set():
+            return
+        restart_topics: List[str] = []
+        for receiver in list(self.receivers):
+            if isinstance(receiver, KafkaReceiver) and not receiver.is_alive():
+                topic = getattr(receiver, 'topic', None)
+                if topic:
+                    restart_topics.append(topic)
+                self.receivers.remove(receiver)
+        if not restart_topics:
+            return
+        for topic in restart_topics:
+            cfg = self.kafka_topic_configs.get(topic)
+            if cfg and not any(t.get('topic') == topic for t in self.kafka_topics):
+                self.kafka_topics.append(cfg)
+        self.kafka_retry_at = time.time() + KAFKA_RETRY_INTERVAL_SECONDS
+        logger.warning(
+            "Kafka receiver stopped unexpectedly for topic(s) %s; will retry in %s seconds.",
+            ", ".join(restart_topics),
+            KAFKA_RETRY_INTERVAL_SECONDS,
+        )
 
     def _build_handler(self, output_directory: str, output_suffix: Optional[str]):
         assembler = ChunkAssembler(self.work_dir, output_directory, output_suffix)
