@@ -5,10 +5,10 @@ import os
 import json
 from pathlib import Path
 import time
+from datetime import datetime
 
 from kafka.errors import KafkaError, NoBrokersAvailable
 
-from charybdisk.file_writer import write_file_safe
 from charybdisk.messages import FileMessage
 from charybdisk.transports.http_transport import HttpPoller
 from charybdisk.transports.kafka_transport import KafkaReceiver
@@ -28,11 +28,11 @@ class FileConsumerGroup(threading.Thread):
         self.kafka_config = kafka_config
         self.receivers: List[threading.Thread] = []
         self.stop_event = threading.Event()
-        self.work_dir = consumer_config.get('working_directory', '/tmp/charybdisk_parts')
         self.kafka_topics: List[Dict[str, Any]] = []
         self.kafka_retry_at: float = 0
         self.default_group_id = kafka_config.get('default_group_id')
         self.start_from_end = self.consumer_config.get('start_from_end', False)
+        self.default_working_directory = consumer_config.get('working_directory')
 
     def run(self) -> None:
         default_http_cfg = self.consumer_config.get('http', {})
@@ -41,7 +41,10 @@ class FileConsumerGroup(threading.Thread):
             transport = topic_cfg.get('transport')
             output_directory = topic_cfg['output_directory']
             output_suffix = topic_cfg.get('output_suffix')
-            on_message = self._build_handler(output_directory, output_suffix)
+            incoming_dir = self._resolve_path(output_directory, topic_cfg.get('incoming_directory'), 'incoming')
+            temp_suffix = topic_cfg.get('temp_suffix', '.tmp')
+            work_dir = self._resolve_work_dir(topic_cfg, output_directory, transport)
+            on_message = self._build_handler(output_directory, output_suffix, incoming_dir, temp_suffix, work_dir)
 
             if transport == 'http':
                 url = topic_cfg.get('url') or topic_cfg.get('endpoint')
@@ -76,7 +79,11 @@ class FileConsumerGroup(threading.Thread):
                 logger.error("Kafka consumer entry missing 'topic'")
                 continue
             try:
-                on_message = self._build_handler(topic_cfg['output_directory'], topic_cfg.get('output_suffix'))
+                output_directory = topic_cfg['output_directory']
+                incoming_dir = self._resolve_path(output_directory, topic_cfg.get('incoming_directory'), 'incoming')
+                temp_suffix = topic_cfg.get('temp_suffix', '.tmp')
+                work_dir = self._resolve_work_dir(topic_cfg, output_directory, topic_cfg.get('transport'))
+                on_message = self._build_handler(output_directory, topic_cfg.get('output_suffix'), incoming_dir, temp_suffix, work_dir)
                 group_id = topic_cfg.get('group_id', self.default_group_id)
                 receiver = KafkaReceiver(self.kafka_config, topic, group_id, self.start_from_end, on_message)
                 receiver.start()
@@ -96,8 +103,30 @@ class FileConsumerGroup(threading.Thread):
         if self.kafka_topics:
             self.kafka_retry_at = time.time() + KAFKA_RETRY_INTERVAL_SECONDS
 
-    def _build_handler(self, output_directory: str, output_suffix: Optional[str]):
-        assembler = ChunkAssembler(self.work_dir, output_directory, output_suffix)
+    def _resolve_work_dir(self, topic_cfg: Dict[str, Any], output_directory: str, transport: Optional[str]) -> Optional[str]:
+        configured = topic_cfg.get('working_directory') or self.default_working_directory
+        if configured:
+            return configured if os.path.isabs(configured) else os.path.join(output_directory, configured)
+        default_dir = os.path.join(output_directory, 'charybdisk_parts')
+        if transport == 'kafka':
+            return default_dir
+        return None
+
+    def _resolve_path(self, base: str, configured: Optional[str], default_subdir: str) -> str:
+        target = configured if configured is not None else default_subdir
+        if os.path.isabs(target):
+            return target
+        return os.path.join(base, target)
+
+    def _build_handler(
+        self,
+        output_directory: str,
+        output_suffix: Optional[str],
+        incoming_dir: str,
+        temp_suffix: str,
+        work_dir: Optional[str],
+    ):
+        assembler = ChunkAssembler(work_dir, output_directory, output_suffix, incoming_dir, temp_suffix)
 
         def handle(file_message: FileMessage) -> None:
             final_path = assembler.handle_chunk(file_message)
@@ -123,14 +152,30 @@ class ChunkAssembler:
     Persists chunks to disk and assembles when all parts are present.
     """
 
-    def __init__(self, work_dir: str, output_directory: str, output_suffix: Optional[str]) -> None:
+    def __init__(
+        self,
+        work_dir: Optional[str],
+        output_directory: str,
+        output_suffix: Optional[str],
+        incoming_directory: str,
+        temp_suffix: str,
+    ) -> None:
         self.work_dir = work_dir
         self.output_directory = output_directory
         self.output_suffix = output_suffix
-        os.makedirs(self.work_dir, exist_ok=True)
+        self.incoming_directory = incoming_directory
+        self.temp_suffix = temp_suffix if temp_suffix else ".tmp"
+        os.makedirs(self.incoming_directory, exist_ok=True)
+        if self.work_dir:
+            os.makedirs(self.work_dir, exist_ok=True)
 
     def handle_chunk(self, file_message: FileMessage) -> Optional[Path]:
-        file_dir = Path(self.work_dir) / file_message.file_id
+        # Fast path for single-chunk payloads when no work_dir is needed
+        if self.work_dir is None and file_message.total_chunks == 1:
+            return self._write_final(file_message.file_name, file_message.content)
+
+        work_dir = self.work_dir or os.path.join(self.output_directory, 'charybdisk_parts')
+        file_dir = Path(work_dir) / file_message.file_id
         os.makedirs(file_dir, exist_ok=True)
 
         meta_path = file_dir / "meta.json"
@@ -160,7 +205,7 @@ class ChunkAssembler:
         for ch in chunks_sorted:
             content += ch.read_bytes()
 
-        final_path = write_file_safe(self.output_directory, file_message.file_name, content, self.output_suffix)
+        final_path = self._write_final(file_message.file_name, content)
         # Cleanup
         for ch in chunks_sorted:
             ch.unlink(missing_ok=True)
@@ -170,3 +215,45 @@ class ChunkAssembler:
         except OSError:
             pass
         return final_path
+
+    def _write_final(self, file_name: str, content: bytes) -> Optional[Path]:
+        target_path = Path(self.output_directory) / file_name
+        if self.output_suffix:
+            if not self.output_suffix.startswith('.'):
+                suffix = f'.{self.output_suffix}'
+            else:
+                suffix = self.output_suffix
+            target_path = target_path.with_suffix(suffix)
+
+        os.makedirs(self.output_directory, exist_ok=True)
+        os.makedirs(self.incoming_directory, exist_ok=True)
+
+        temp_name = f"{target_path.name}{self.temp_suffix}"
+        temp_path = Path(self.incoming_directory) / temp_name
+
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(content)
+
+            if target_path.exists():
+                try:
+                    existing_content = target_path.read_bytes()
+                    if existing_content == content:
+                        temp_path.unlink(missing_ok=True)
+                        logger.info(f"File '{target_path}' already exists with identical content. Skipping write.")
+                        return target_path
+                    timestamp = datetime.now().strftime('%Y%m%d%H%M%S%f')
+                    target_path = target_path.with_name(f"{target_path.stem}_{timestamp}{target_path.suffix}")
+                except Exception as e:
+                    logger.error(f"Error reading existing file '{target_path}': {e}")
+                    return None
+
+            os.replace(temp_path, target_path)
+            return target_path
+        except Exception as e:
+            logger.error(f"Error writing file '{target_path}' (original: '{file_name}') to directory '{self.output_directory}': {e}")
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None

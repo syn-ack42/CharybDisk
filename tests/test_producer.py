@@ -1,13 +1,13 @@
 import os
 import time
 from requests.exceptions import ReadTimeout
-from charybdisk.messages import FileMessage
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
 from kafka.errors import NoBrokersAvailable
 
+from charybdisk.messages import FileMessage
 from charybdisk.producer import FileProducer
 from charybdisk.transports.base import SendResult, Transport
 from charybdisk.transports.http_transport import HttpTransport
@@ -51,16 +51,20 @@ def make_producer(tempdir: str) -> FileProducer:
     return FileProducer(producer_cfg, kafka_cfg)
 
 
-def test_process_file_deletes_when_no_backup():
+def test_process_file_moves_to_default_backup():
     with TemporaryDirectory() as tmpdir:
         producer = make_producer(tmpdir)
         dummy_transport = DummyTransport()
         file_path = Path(tmpdir) / "test.txt"
         file_path.write_text("hello world")
 
-        producer.process_file(str(file_path), "http://example.com/upload", "cfg", None, dummy_transport, None)
+        backup_dir = Path(tmpdir) / "done"
+        producer.process_file(str(file_path), "http://example.com/upload", "cfg", str(backup_dir), dummy_transport, None)
 
-        assert not file_path.exists(), "File should be removed when no backup directory is configured"
+        assert not file_path.exists(), "File should be moved out of original directory"
+        moved_files = list(backup_dir.glob("*"))
+        assert len(moved_files) == 1, "One file should be in backup directory"
+        assert moved_files[0].read_text() == "hello world"
         assert dummy_transport.sent, "Transport should have been called"
 
 
@@ -87,11 +91,14 @@ def test_process_file_respects_failed_transport():
         src_file = Path(tmpdir) / "test3.txt"
         src_file.write_text("content")
 
-        producer.process_file(str(src_file), "http://example.com/upload", "cfg", None, dummy_transport, None)
+        error_dir = Path(tmpdir) / "error"
+        producer.process_file(str(src_file), "http://example.com/upload", "cfg", None, dummy_transport, str(error_dir))
 
-        # On failure, original file should remain and no deletion should occur
-        assert src_file.exists()
+        # On failure, original file should be moved to error (not left in source)
+        assert not src_file.exists()
         assert dummy_transport.sent
+        # It should be moved to error if configured
+        assert (error_dir / src_file.name).exists()
 
 
 def test_kafka_unavailable_does_not_block_http(monkeypatch, tmp_path):
@@ -151,3 +158,30 @@ def test_http_read_timeout_treated_as_success(monkeypatch):
     )
     result = transport.send("http://example.com/upload", msg)
     assert result.success
+
+
+def test_process_directory_uses_pending_and_backup(monkeypatch, tmp_path):
+    producer = make_producer(tmp_path.as_posix())
+    dummy_transport = DummyTransport()
+    monkeypatch.setattr(FileProducer, "_get_transport_for_directory", lambda self, directory: dummy_transport)
+
+    dir_cfg = producer.directories[0]
+    base = Path(dir_cfg["path"])
+    pending = base / "pending"
+    backup = base / "done"
+    pending.mkdir(parents=True, exist_ok=True)
+
+    file_base = base / "a.txt"
+    file_base.write_text("one")
+    file_pending = pending / "b.txt"
+    file_pending.write_text("two")
+
+    producer.process_directory(dir_cfg)
+
+    assert not file_base.exists()
+    assert not file_pending.exists()
+    backups = list(backup.glob("*"))
+    assert len(backups) == 2
+    contents = sorted(p.read_text() for p in backups)
+    assert contents == ["one", "two"]
+    assert dummy_transport.sent

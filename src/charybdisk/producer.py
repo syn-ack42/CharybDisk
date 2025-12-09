@@ -130,9 +130,10 @@ class FileProducer(threading.Thread):
         destination = directory.get('destination') or directory.get('topic') or directory.get('url')
         config_id = directory['id']
         file_pattern = directory.get('file_pattern', '*')
-        backup_directory = directory.get('backup_directory')
+        pending_directory = self._resolve_subdir(directory_path, directory.get('pending_directory'), default_subdir='pending')
+        backup_directory = self._resolve_subdir(directory_path, directory.get('backup_directory') or 'done', default_subdir='done')
         transport = self._get_transport_for_directory(directory)
-        error_directory = directory.get('error_directory') or os.path.join(directory_path, 'error')
+        error_directory = self._resolve_subdir(directory_path, directory.get('error_directory') or 'error', default_subdir='error')
 
         if not destination:
             logger.error(f"Directory config '{config_id}' missing destination (topic/url). Skipping.")
@@ -149,15 +150,28 @@ class FileProducer(threading.Thread):
             logger.error(f"No read permission for directory '{directory_path}'.")
             return
 
-        files = glob.glob(os.path.join(directory_path, file_pattern))
-        files = [f for f in files if os.path.isfile(f)]
+        os.makedirs(pending_directory, exist_ok=True)
+        files = self._gather_files([pending_directory, directory_path], file_pattern)
         if files:
             logger.info("Found %d file(s) in '%s' for destination '%s'.", len(files), directory_path, destination)
         for file_path in files:
             if self.stop_event.is_set():
                 break
             try:
-                self.process_file(file_path, destination, config_id, backup_directory, transport, error_directory)
+                send_path = file_path
+                if not file_path.startswith(os.path.join(pending_directory, '')):
+                    if self.file_preparer.is_file_open(file_path):
+                        logger.info("File '%s' appears open; skipping for now.", file_path)
+                        continue
+                    dest_path = os.path.join(pending_directory, os.path.basename(file_path))
+                    try:
+                        os.replace(file_path, dest_path)
+                        send_path = dest_path
+                    except Exception as move_err:
+                        logger.error(f"Failed to move file '{file_path}' to pending directory '{pending_directory}': {move_err}")
+                        continue
+
+                self.process_file(send_path, destination, config_id, backup_directory, transport, error_directory)
             except Exception as e:
                 self.handle_file_processing_error(file_path, e)
 
@@ -215,12 +229,6 @@ class FileProducer(threading.Thread):
                 )
                 if backup_directory and prepared.backup_name:
                     backup_file(prepared.original_path, backup_directory, prepared.backup_name)
-                elif backup_directory is None:
-                    try:
-                        os.remove(prepared.original_path)
-                        logger.info(f"Removed source file '{prepared.original_path}' after successful send (no backup configured).")
-                    except Exception as e:
-                        logger.error(f"Failed to remove source file '{prepared.original_path}' after send: {e}")
         except Exception as e:
             logger.error(f"Transport send failed for file '{file_path}': {e}")
             if error_directory:
@@ -247,6 +255,24 @@ class FileProducer(threading.Thread):
             self._handle_kafka_failure(error)
         else:
             logger.error(f"Error processing directory '{directory['path']}': {error}, continuing")
+
+    def _resolve_subdir(self, base: str, configured: Optional[str], default_subdir: str) -> str:
+        target = configured if configured is not None else default_subdir
+        if os.path.isabs(target):
+            return target
+        return os.path.join(base, target)
+
+    def _gather_files(self, directories: List[str], pattern: str) -> List[str]:
+        seen = set()
+        collected: List[str] = []
+        for d in directories:
+            if not os.path.exists(d):
+                continue
+            for path in glob.glob(os.path.join(d, pattern)):
+                if os.path.isfile(path) and path not in seen:
+                    collected.append(path)
+                    seen.add(path)
+        return collected
 
     def _handle_kafka_failure(self, error: Exception) -> None:
         logger.info(
