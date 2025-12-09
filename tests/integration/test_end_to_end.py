@@ -350,35 +350,7 @@ def test_end_to_end_http_and_kafka(app_process):
     )
 
     if not found_http:
-        log_file = app_process["log_file"]
-        integ_log = app_process.get("integration_log")
-
-        try:
-            log_tail = Path(log_file).read_text().splitlines()[-200:]
-        except Exception:
-            log_tail = ["<unable to read log>"]
-
-        integ_tail = []
-        if integ_log and integ_log.exists():
-            try:
-                integ_tail = integ_log.read_text().splitlines()[-200:]
-            except Exception:
-                integ_tail = ["<unable to read integration log>"]
-
-        threads = _dump_threads()
-        up_tree = _dump_tree(dirs["upload_http"])
-        dl_tree = _dump_tree(dirs["download_http"])
-        err_tree = _dump_tree(dirs["error_http"])
-
-        pytest.fail(
-            "HTTP file not received.\n\n"
-            "==== THREADS ====\n" + threads + "\n\n"
-            "==== UPLOAD_HTTP TREE ====\n" + up_tree + "\n\n"
-            "==== DOWNLOAD_HTTP TREE ====\n" + dl_tree + "\n\n"
-            "==== ERROR_HTTP TREE ====\n" + err_tree + "\n\n"
-            "==== STDOUT LOG (tail) ====\n" + "\n".join(log_tail) + "\n\n"
-            "==== INTEGRATION LOG (tail) ====\n" + "\n".join(integ_tail)
-        )
+        pytest.fail("HTTP file not received.")
 
     # Kafka path
     assert _wait_for_file(dirs["download_kafka"] / large_kafka.name, timeout=120)
@@ -394,8 +366,11 @@ def test_end_to_end_http_and_kafka(app_process):
 def test_under_load_with_restarts(app_process):
     dirs = app_process["dirs"]
     runtime = int(os.environ.get("INTEGRATION_RUNTIME", "300"))
-    restart_every = int(os.environ.get("INTEGRATION_RESTART_EVERY", "30"))
+    restart_every = int(os.environ.get("INTEGRATION_RESTART_EVERY", "40"))
     end_time = time.time() + runtime
+    sent_files = []
+    sent_http = 0
+    sent_kafka = 0
 
     def restarter(proc):
         while time.time() < end_time and proc.poll() is None:
@@ -420,7 +395,57 @@ def test_under_load_with_restarts(app_process):
         fname = _rand_name("mix", random.choice(["txt", "bin", "json"]))
         size = random.choice([256, 2048, 50_000, 300_000, 700_000])
         target_dir = random.choice([dirs["upload_http"], dirs["upload_kafka"]])
-        _write_random_file(target_dir / fname, size)
+        dest_dir = dirs["download_http"] if target_dir == dirs["upload_http"] else dirs["download_kafka"]
+        if target_dir == dirs["upload_http"]:
+            sent_http += 1
+        else:
+            sent_kafka += 1
+        file_path = target_dir / fname
+        _write_random_file(file_path, size)
+        sent_files.append((file_path.name, size, dest_dir))
         time.sleep(0.5)
 
     t.join()
+
+    # Allow up to 2 minutes after sending stops for all files to arrive
+    deadline = time.time() + 120
+    pending = list(sent_files)
+    while pending and time.time() < deadline:
+        pending = [
+            (name, size, dest)
+            for (name, size, dest) in pending
+            if not (dest / name).exists()
+        ]
+        if pending:
+            time.sleep(1)
+
+    missing = [(name, dest) for (name, _, dest) in pending]
+    if missing:
+        sample = ", ".join(f"{n}->{dest}" for n, dest in missing[:10])
+        pytest.fail(
+            f"{len(missing)} files not received back within timeout. "
+            f"Sent http={sent_http}, kafka={sent_kafka}. Sample: {sample}"
+        )
+
+    received_http = sum(1 for (name, _, dest) in sent_files if dest == dirs["download_http"] and (dest / name).exists())
+    received_kafka = sum(1 for (name, _, dest) in sent_files if dest == dirs["download_kafka"] and (dest / name).exists())
+
+    error_http_dir = dirs["error_http"] / "error"
+    error_kafka_dir = dirs["error_kafka"]
+    errors_found = []
+    for name, _, dest in sent_files:
+        err_dir = error_http_dir if dest == dirs["download_http"] else error_kafka_dir
+        err_path = err_dir / name
+        if err_path.exists():
+            errors_found.append(err_path)
+
+    if errors_found:
+        pytest.fail(
+            f"Files landed in error directories: {len(errors_found)} (e.g., {errors_found[:5]}) "
+            f"(sent http={sent_http}, kafka={sent_kafka}, received http={received_http}, kafka={received_kafka})"
+        )
+
+    assert received_http == sent_http and received_kafka == sent_kafka, (
+        f"Mismatch counts: sent http={sent_http}, kafka={sent_kafka}; "
+        f"received http={received_http}, kafka={received_kafka}"
+    )

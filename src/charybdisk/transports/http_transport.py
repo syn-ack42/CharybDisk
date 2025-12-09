@@ -75,7 +75,6 @@ class HttpTransport(Transport):
                 headers=headers,
                 data=message.content,
                 timeout=self.http_config.get('timeout', 300),
-                stream=True,  # Do not wait for full body; headers are enough
             )
             try:
                 logger.info(
