@@ -402,7 +402,10 @@ def test_under_load_with_restarts(app_process):
             sent_kafka += 1
         file_path = target_dir / fname
         _write_random_file(file_path, size)
-        sent_files.append((file_path.name, size, dest_dir))
+        sent_files.append((file_path.name, size, dest_dir, target_dir))
+        total_sent = sent_http + sent_kafka
+        if total_sent % 10 == 0:
+            print(f"[integration] sent so far: http={sent_http}, kafka={sent_kafka}")
         time.sleep(0.5)
 
     t.join()
@@ -412,28 +415,39 @@ def test_under_load_with_restarts(app_process):
     pending = list(sent_files)
     while pending and time.time() < deadline:
         pending = [
-            (name, size, dest)
-            for (name, size, dest) in pending
+            (name, size, dest, source)
+            for (name, size, dest, source) in pending
             if not (dest / name).exists()
         ]
+        received_http = sum(1 for (name, _, dest, _) in sent_files if dest == dirs["download_http"] and (dest / name).exists())
+        received_kafka = sum(1 for (name, _, dest, _) in sent_files if dest == dirs["download_kafka"] and (dest / name).exists())
+        total_received = received_http + received_kafka
+        if total_received > 0 and total_received % 10 == 0:
+            print(
+                f"[integration] received so far: http={received_http}/{sent_http}, "
+                f"kafka={received_kafka}/{sent_kafka}"
+            )
         if pending:
             time.sleep(1)
 
-    missing = [(name, dest) for (name, _, dest) in pending]
+    missing = [(name, dest) for (name, _, dest, _) in pending]
     if missing:
+        http_missing = sum(1 for (_, dest) in missing if dest == dirs["download_http"])
+        kafka_missing = sum(1 for (_, dest) in missing if dest == dirs["download_kafka"])
         sample = ", ".join(f"{n}->{dest}" for n, dest in missing[:10])
         pytest.fail(
-            f"{len(missing)} files not received back within timeout. "
+            f"{len(missing)} files not received back within timeout "
+            f"(http missing={http_missing}, kafka missing={kafka_missing}). "
             f"Sent http={sent_http}, kafka={sent_kafka}. Sample: {sample}"
         )
 
-    received_http = sum(1 for (name, _, dest) in sent_files if dest == dirs["download_http"] and (dest / name).exists())
-    received_kafka = sum(1 for (name, _, dest) in sent_files if dest == dirs["download_kafka"] and (dest / name).exists())
+    received_http = sum(1 for (name, _, dest, _) in sent_files if dest == dirs["download_http"] and (dest / name).exists())
+    received_kafka = sum(1 for (name, _, dest, _) in sent_files if dest == dirs["download_kafka"] and (dest / name).exists())
 
     error_http_dir = dirs["error_http"] / "error"
     error_kafka_dir = dirs["error_kafka"]
     errors_found = []
-    for name, _, dest in sent_files:
+    for name, _, dest, _ in sent_files:
         err_dir = error_http_dir if dest == dirs["download_http"] else error_kafka_dir
         err_path = err_dir / name
         if err_path.exists():
