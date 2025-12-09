@@ -75,6 +75,7 @@ class HttpTransport(Transport):
                 headers=headers,
                 data=message.content,
                 timeout=self.http_config.get('timeout', 300),
+                stream=False,  # read full response to ensure server completes write
             )
             try:
                 logger.info(
