@@ -33,7 +33,7 @@ See `config.example.yaml` for a complete template using the legacy directories/t
   - Defaults: runtime 60s, restart every 20s; override via `INTEGRATION_RUNTIME` and `INTEGRATION_RESTART_EVERY`.
 
 ## Windows Service + Installer (WiX + WinSW)
-- Build exe on Windows with PyInstaller: `pyinstaller --name charybdisk --onefile -m charybdisk` (output in `dist\charybdisk.exe`).
+- Build exe on Windows with PyInstaller: `pyinstaller --name charybdisk -F main.py` (output in `dist\charybdisk.exe`).
 - Download WinSW (x64) and rename to `charybdisk-service.exe`. Copy `tools/windows/winsw-example.xml` next to it, rename to `charybdisk-service.xml`, and edit `<executable>` (point to `charybdisk.exe`) and `<arguments>` (point to your external `config.yaml`, e.g., `C:\ProgramData\CharybDisk\config.yaml`).
 - Gather build payloads into a folder (e.g., `C:\charybdisk-build`): `charybdisk.exe`, `charybdisk-service.exe`, `charybdisk-service.xml`, `config.example.yaml`.
 - Build MSI with WiX v4 installed/on PATH: `wix build -dBuildOutput="C:\charybdisk-build" tools/windows/charybdisk.wxs`
