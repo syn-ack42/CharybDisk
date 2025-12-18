@@ -32,5 +32,7 @@ See `config.example.yaml` for a complete template using the legacy directories/t
 - Integration tests (require Docker, http/kafka test stacks): `RUN_INTEGRATION=1 pytest tests/integration/test_end_to_end.py -v`
   - Defaults: runtime 60s, restart every 20s; override via `INTEGRATION_RUNTIME` and `INTEGRATION_RESTART_EVERY`.
 
-## Windows Service
+## Windows executables
 - Build exe on Windows with PyInstaller: `pyinstaller --name charybdisk -F main.py` (output in `dist\charybdisk.exe`).
+- Build an executbale that cn be installed as a windows service with PyInstaller: `pyinstaller charybdisk_win_service.spec` (output in `dist\charybdisk_win_service.exe`). Install service with charybdisk_win_service.exe install. Will require a charybdisk-conf.yaml with a working configuration to exist next to the exe!
+
