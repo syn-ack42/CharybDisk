@@ -32,9 +32,5 @@ See `config.example.yaml` for a complete template using the legacy directories/t
 - Integration tests (require Docker, http/kafka test stacks): `RUN_INTEGRATION=1 pytest tests/integration/test_end_to_end.py -v`
   - Defaults: runtime 60s, restart every 20s; override via `INTEGRATION_RUNTIME` and `INTEGRATION_RESTART_EVERY`.
 
-## Windows Service + Installer (WiX + WinSW)
+## Windows Service
 - Build exe on Windows with PyInstaller: `pyinstaller --name charybdisk -F main.py` (output in `dist\charybdisk.exe`).
-- Download WinSW (x64) and rename to `charybdisk-service.exe`. Copy `tools/windows/winsw-example.xml` next to it, rename to `charybdisk-service.xml`, and edit `<executable>` (point to `charybdisk.exe`) and `<arguments>` (point to your external `config.yaml`, e.g., `C:\ProgramData\CharybDisk\config.yaml`).
-- Gather build payloads into a folder (e.g., `C:\charybdisk-build`): `charybdisk.exe`, `charybdisk-service.exe`, `charybdisk-service.xml`, `config.example.yaml`.
-- Build MSI with WiX v4 installed/on PATH: `wix build -dBuildOutput="C:\charybdisk-build" tools/windows/charybdisk.wxs`
-- Install MSI (elevated). It copies binaries to `Program Files\CharybDisk`, sample config to `ProgramData\CharybDisk`, and runs `charybdisk-service.exe install`. Put your real `config.yaml` at the path referenced in the WinSW XML.

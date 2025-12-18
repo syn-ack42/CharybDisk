@@ -115,7 +115,7 @@ class HttpPoller(Receiver, threading.Thread):
         on_message,
         headers: Optional[Dict[str, str]] = None,
     ) -> None:
-        threading.Thread.__init__(self, daemon=False)
+        threading.Thread.__init__(self, daemon=True)
         self.http_config = http_config
         self.url = url
         self.on_message = on_message
@@ -134,12 +134,12 @@ class HttpPoller(Receiver, threading.Thread):
             fetched_any = False
             try:
                 while not self._stopped.is_set():
-                    logger.info("HTTP poll -> %s", self.url)
+                    logger.debug("HTTP poll -> %s", self.url)
                     resp = self.session.get(self.url, headers=self.extra_headers, timeout=timeout)
                     resp_len = len(resp.content or b"")
-                    logger.info("HTTP poll <- %s status=%s bytes=%s", self.url, resp.status_code, resp_len)
+                    logger.debug("HTTP poll <- %s status=%s bytes=%s", self.url, resp.status_code, resp_len)
                     if resp.status_code == 204 or not resp.content:
-                        logger.info("HTTP poll %s returned no content (status=%s)", self.url, resp.status_code)
+                        logger.debug("HTTP poll %s returned no content (status=%s)", self.url, resp.status_code)
                         break
                     if resp.ok:
                         fetched_any = True

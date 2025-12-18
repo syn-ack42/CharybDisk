@@ -76,7 +76,7 @@ class KafkaReceiver(Receiver, threading.Thread):
         start_from_end: bool,
         on_message: Callable[[FileMessage], None],
     ) -> None:
-        threading.Thread.__init__(self, daemon=False)
+        threading.Thread.__init__(self, daemon=True)
         self.kafka_config = kafka_config
         self.topic = topic
         self.group_id = group_id or kafka_config.get('default_group_id', 'default_group')

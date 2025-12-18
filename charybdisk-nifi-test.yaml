@@ -1,0 +1,33 @@
+logging:
+  console_log_level: info
+  file_log_level: info
+  log_file: ./charybdisk.log
+
+producer:
+  enabled: true
+  http:
+    default_headers: {Authorization: "Bearer 1561gb1w14t564b14jnb6"}
+    timeout: 30
+    max_transfer_file_size: null  # optional; null means unlimited
+  scan_interval: 10
+  directories:
+    - id: HTTP_PUSH
+      transport: http
+      path: 'c:/temp/out'
+      file_pattern: "*"
+      destination: "https://data-integration.dev.cadis.cloud/flow/queue/push"
+      headers: {Authorization: "Basic dXNlcjpwYXNz"}
+
+consumer:
+  enabled: true
+  http:
+    poll_interval: 5
+    timeout: 30
+    # default_headers: {Authorization: "Bearer token"}
+  topics:
+    # Example HTTP polling consumer
+    - transport: http
+      default_headers: {Authorization: "Bearer 1561gb1w14t564b14jnb6"}
+      output_directory: 'c:/temp/in'
+      url: "https://data-integration.dev.cadis.cloud/flow/queue/pop"
+      headers: {Authorization: "Bearer secret-token"}
