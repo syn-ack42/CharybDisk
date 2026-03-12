@@ -85,7 +85,8 @@ class HttpTransport(Transport):
                 )
                 if resp.ok:
                     return SendResult(True)
-                return SendResult(False, Exception(f"HTTP {resp.status_code}: {resp.text}"))
+                transient = resp.status_code >= 500
+                return SendResult(False, Exception(f"HTTP {resp.status_code}: {resp.text}"), transient=transient)
             finally:
                 resp.close()
         except ReadTimeout as e:
@@ -95,13 +96,13 @@ class HttpTransport(Transport):
                 self.http_config.get('timeout'),
                 e,
             )
-            return SendResult(True)
+            return SendResult(True, assumed_success=True)
         except ConnectTimeout as e:
             logger.warning("HTTP send connect timeout for %s (configured timeout=%s): %s", url, self.http_config.get('timeout'), e)
-            return SendResult(False, e)
+            return SendResult(False, e, transient=True)
         except Exception as e:
             logger.error("HTTP send failed for %s: %s", url, e)
-            return SendResult(False, e)
+            return SendResult(False, e, transient=True)
 
     def stop(self) -> None:
         self.session.close()
@@ -136,44 +137,47 @@ class HttpPoller(Receiver, threading.Thread):
                 while not self._stopped.is_set():
                     logger.debug("HTTP poll -> %s", self.url)
                     resp = self.session.get(self.url, headers=self.extra_headers, timeout=timeout)
-                    resp_len = len(resp.content or b"")
-                    logger.debug("HTTP poll <- %s status=%s bytes=%s", self.url, resp.status_code, resp_len)
-                    if resp.status_code == 204 or not resp.content:
-                        logger.debug("HTTP poll %s returned no content (status=%s)", self.url, resp.status_code)
-                        break
-                    if resp.ok:
-                        fetched_any = True
-                        original_b64 = resp.headers.get('X-Original-File-Name-B64')
-                        if original_b64:
-                            try:
-                                file_name = base64.b64decode(original_b64).decode('utf-8')
-                            except Exception:
+                    try:
+                        resp_len = len(resp.content or b"")
+                        logger.debug("HTTP poll <- %s status=%s bytes=%s", self.url, resp.status_code, resp_len)
+                        if resp.status_code == 204 or not resp.content:
+                            logger.debug("HTTP poll %s returned no content (status=%s)", self.url, resp.status_code)
+                            break
+                        if resp.ok:
+                            fetched_any = True
+                            original_b64 = resp.headers.get('X-Original-File-Name-B64')
+                            if original_b64:
+                                try:
+                                    file_name = base64.b64decode(original_b64).decode('utf-8')
+                                except Exception:
+                                    file_name = resp.headers.get('X-File-Name', 'file.bin')
+                            else:
                                 file_name = resp.headers.get('X-File-Name', 'file.bin')
-                        else:
-                            file_name = resp.headers.get('X-File-Name', 'file.bin')
-                        create_timestamp = resp.headers.get('X-Create-Timestamp', '')
-                        content = resp.content
-                        logger.info(
-                            "HTTP poll <- %s delivered file '%s' (%s bytes)",
-                            self.url,
-                            file_name,
-                            len(content),
-                        )
-                        self.on_message(
-                            FileMessage(
-                                file_name=file_name,
-                                create_timestamp=create_timestamp,
-                                content=content,
-                                file_id=file_name,
-                                chunk_index=0,
-                                total_chunks=1,
-                                original_size=len(content),
+                            create_timestamp = resp.headers.get('X-Create-Timestamp', '')
+                            content = resp.content
+                            logger.info(
+                                "HTTP poll <- %s delivered file '%s' (%s bytes)",
+                                self.url,
+                                file_name,
+                                len(content),
                             )
-                        )
-                        continue
+                            self.on_message(
+                                FileMessage(
+                                    file_name=file_name,
+                                    create_timestamp=create_timestamp,
+                                    content=content,
+                                    file_id=file_name,
+                                    chunk_index=0,
+                                    total_chunks=1,
+                                    original_size=len(content),
+                                )
+                            )
+                            continue
 
-                    logger.error(f"HTTP poll failed {resp.status_code}: {resp.text}")
-                    break
+                        logger.error(f"HTTP poll failed {resp.status_code}: {resp.text}")
+                        break
+                    finally:
+                        resp.close()
             except Exception as e:
                 logger.error(f"HTTP polling error for {self.url}: {e}")
             finally:

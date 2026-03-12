@@ -5,9 +5,19 @@ from charybdisk.messages import FileMessage
 
 
 class SendResult:
-    def __init__(self, success: bool, error: Optional[Exception] = None):
+    def __init__(
+        self,
+        success: bool,
+        error: Optional[Exception] = None,
+        assumed_success: bool = False,
+        transient: bool = False,
+    ):
         self.success = success
         self.error = error
+        # True when success was assumed after a ReadTimeout (delivery unconfirmed)
+        self.assumed_success = assumed_success
+        # True when failure is transient (5xx, connection error) and the file should be retried
+        self.transient = transient
 
 
 class Transport(ABC):

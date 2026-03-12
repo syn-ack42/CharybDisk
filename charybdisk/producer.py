@@ -132,6 +132,7 @@ class FileProducer(threading.Thread):
         file_pattern = directory.get('file_pattern', '*')
         pending_directory = self._resolve_subdir(directory_path, directory.get('pending_directory'), default_subdir='pending')
         backup_directory = self._resolve_subdir(directory_path, directory.get('backup_directory') or 'done', default_subdir='done')
+        timeout_directory = self._resolve_subdir(directory_path, directory.get('timeout_directory') or 'done_timeout', default_subdir='done_timeout')
         transport = self._get_transport_for_directory(directory)
         error_directory = self._resolve_subdir(directory_path, directory.get('error_directory') or 'error', default_subdir='error')
 
@@ -171,7 +172,7 @@ class FileProducer(threading.Thread):
                         logger.error(f"Failed to move file '{file_path}' to pending directory '{pending_directory}': {move_err}")
                         continue
 
-                self.process_file(send_path, destination, config_id, backup_directory, transport, error_directory)
+                self.process_file(send_path, destination, config_id, backup_directory, transport, error_directory, timeout_directory)
             except Exception as e:
                 self.handle_file_processing_error(file_path, e)
 
@@ -183,6 +184,7 @@ class FileProducer(threading.Thread):
         backup_directory: Optional[str],
         transport: Transport,
         error_directory: Optional[str],
+        timeout_directory: Optional[str] = None,
     ) -> None:
         try:
             prepared = self.file_preparer.prepare(file_path, transport.max_transfer_size())
@@ -197,13 +199,23 @@ class FileProducer(threading.Thread):
             total_chunks = max(1, (len(file_bytes) + chunk_size - 1) // chunk_size)
             file_id = f"{prepared.message.file_name}-{uuid.uuid4().hex}"
             all_sent = True
+            assumed_success = False
 
             # HTTP transports should not be chunked; send the prepared message once.
             if isinstance(transport, HttpTransport):
                 result: SendResult = transport.send(destination, prepared.message)
                 if not result.success:
+                    if result.transient:
+                        logger.warning(
+                            "Transient HTTP failure for '%s' (destination '%s'); file left in pending for retry on next scan: %s",
+                            file_path,
+                            destination,
+                            result.error,
+                        )
+                        return
                     all_sent = False
                     raise result.error or Exception("HTTP transport send error")
+                assumed_success = result.assumed_success
             else:
                 for idx in range(total_chunks):
                     start = idx * chunk_size
@@ -224,11 +236,20 @@ class FileProducer(threading.Thread):
                         raise result.error or Exception("Unknown transport send error")
 
             if all_sent:
-                logger.info(
-                    f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to destination '{destination}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
-                )
-                if backup_directory and prepared.backup_name:
-                    backup_file(prepared.original_path, backup_directory, prepared.backup_name)
+                if assumed_success:
+                    effective_backup = timeout_directory or backup_directory
+                    logger.warning(
+                        "File '%s' sent with ReadTimeout (delivery unconfirmed); moving to timeout directory '%s'.",
+                        prepared.message.file_name,
+                        effective_backup,
+                    )
+                else:
+                    effective_backup = backup_directory
+                    logger.info(
+                        f"Sent file '{prepared.message.file_name}' (create timestamp: {prepared.message.create_timestamp}) to destination '{destination}' (Configuration ID: {config_id}). Backup file name: '{prepared.backup_name}'."
+                    )
+                if effective_backup and prepared.backup_name:
+                    backup_file(prepared.original_path, effective_backup, prepared.backup_name)
         except Exception as e:
             logger.error(f"Transport send failed for file '{file_path}': {e}")
             if error_directory:
