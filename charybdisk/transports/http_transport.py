@@ -99,10 +99,19 @@ class HttpTransport(Transport):
             return SendResult(True, assumed_success=True)
         except ConnectTimeout as e:
             logger.warning("HTTP send connect timeout for %s (configured timeout=%s): %s", url, self.http_config.get('timeout'), e)
+            self._reset_session()
             return SendResult(False, e, transient=True)
         except Exception as e:
             logger.error("HTTP send failed for %s: %s", url, e)
+            self._reset_session()
             return SendResult(False, e, transient=True)
+
+    def _reset_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
 
     def stop(self) -> None:
         self.session.close()
@@ -185,6 +194,7 @@ class HttpPoller(Receiver, threading.Thread):
             except Exception as e:
                 logger.error(f"HTTP polling error for {self.url}: {e}")
                 had_error = True
+                self._reset_session()
             finally:
                 if self._stopped.is_set():
                     break
@@ -205,6 +215,13 @@ class HttpPoller(Receiver, threading.Thread):
                         consecutive_errors = 0
                     if not fetched_any:
                         self._stopped.wait(poll_interval)
+
+    def _reset_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
 
     def start(self) -> None:  # type: ignore[override]
         threading.Thread.start(self)

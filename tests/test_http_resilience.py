@@ -145,6 +145,37 @@ class TestHttpTransportSendResult:
         assert not result.success
         assert result.transient
 
+    def test_connect_timeout_resets_session(self):
+        transport = HttpTransport({"timeout": 5})
+        original_session = transport.session
+        transport.session.post = MagicMock(side_effect=ConnectTimeout("connect timed out"))
+        transport.send("http://example.com", _make_file_message())
+        assert transport.session is not original_session, "Session must be replaced after ConnectTimeout"
+
+    def test_connection_error_resets_session(self):
+        from requests.exceptions import ConnectionError as ReqConnectionError
+        transport = HttpTransport({"timeout": 5})
+        original_session = transport.session
+        transport.session.post = MagicMock(side_effect=ReqConnectionError("connection refused"))
+        transport.send("http://example.com", _make_file_message())
+        assert transport.session is not original_session, "Session must be replaced after ConnectionError"
+
+    def test_read_timeout_does_not_reset_session(self):
+        """ReadTimeout means the server received data but was slow to respond — session is healthy."""
+        transport = HttpTransport({"timeout": 5})
+        original_session = transport.session
+        transport.session.post = MagicMock(side_effect=ReadTimeout("timed out"))
+        transport.send("http://example.com", _make_file_message())
+        assert transport.session is original_session, "Session must NOT be replaced after ReadTimeout"
+
+    def test_5xx_does_not_reset_session(self):
+        """5xx means a valid HTTP response was received — the connection pool is healthy."""
+        transport = HttpTransport({"timeout": 5})
+        original_session = transport.session
+        transport.session.post = MagicMock(return_value=_make_response(503, "down"))
+        transport.send("http://example.com", _make_file_message())
+        assert transport.session is original_session, "Session must NOT be replaced after 5xx response"
+
 
 # ---------------------------------------------------------------------------
 # FileProducer.process_file() — file routing
@@ -617,24 +648,43 @@ class TestHttpPollerBackoff:
             f"First wait after recovery must be poll_interval={poll_interval}, got {post_recovery_waits[0]}"
         )
 
+    def test_exception_resets_session(self):
+        """A connection-level exception must replace the session so stale connections are discarded."""
+        poller, _ = self._make_poller(poll_interval=1, max_poll_interval=60)
+        original_session = poller.session
+
+        def stop_on_any_wait(timeout=None):
+            poller._stopped.set()
+            return True
+
+        poller._stopped.wait = stop_on_any_wait
+
+        def raises_connection_error(*args, **kwargs):
+            raise ConnectionError("broken pipe")
+
+        poller.session.get = raises_connection_error
+        poller.run()
+
+        assert poller.session is not original_session, "Session must be replaced after connection error"
+
     def test_exception_also_triggers_backoff(self):
         """Network exceptions (not just 5xx) must increment the backoff counter."""
         poller, _ = self._make_poller(poll_interval=1, max_poll_interval=60)
         waits = []
+        # Suppress session reset so the fake `get` stays attached after each exception.
+        # Session-reset correctness is covered by test_exception_resets_session.
+        poller._reset_session = lambda: None
 
         def capturing_wait(timeout=None):
             if timeout and timeout > 0:
                 waits.append(timeout)
-            return True
+            if len(waits) >= 3:
+                poller._stopped.set()
+            return poller._stopped.is_set()
 
         poller._stopped.wait = capturing_wait
 
-        call_count = [0]
-
         def always_raises(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] > 3:
-                poller._stopped.set()
             raise ConnectionError("connection refused")
 
         poller.session.get = always_raises
