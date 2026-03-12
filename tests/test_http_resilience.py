@@ -481,3 +481,164 @@ class TestHttpPollerResilience:
 
         assert delivered, "Poller must deliver message after backend recovers"
         assert delivered[0].file_name == "recovered.txt"
+
+
+# ---------------------------------------------------------------------------
+# HttpPoller — exponential backoff on consecutive errors
+# ---------------------------------------------------------------------------
+
+class TestHttpPollerBackoff:
+
+    def _make_poller(self, poll_interval=0, max_poll_interval=300):
+        received = []
+        poller = HttpPoller(
+            {"poll_interval": poll_interval, "max_poll_interval": max_poll_interval, "timeout": 1},
+            "http://x",
+            received.append,
+        )
+        return poller, received
+
+    def test_wait_doubles_on_consecutive_errors(self):
+        """Each consecutive 500 must double the wait up to max_poll_interval."""
+        poller, _ = self._make_poller(poll_interval=1, max_poll_interval=60)
+        waits = []
+        original_wait = poller._stopped.wait
+
+        def capturing_wait(timeout=None):
+            if timeout and timeout > 0:
+                waits.append(timeout)
+            return True  # act as if stopped so the loop exits after each wait
+
+        poller._stopped.wait = capturing_wait
+
+        call_count = [0]
+
+        def always_500(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] > 4:
+                poller._stopped.set()
+            resp = _make_response(500, "err", b"err")
+            resp.close = MagicMock()
+            return resp
+
+        poller.session.get = always_500
+        poller.run()
+
+        # waits should be 1, 2, 4, 8 (poll_interval * 2^n)
+        assert len(waits) >= 3
+        assert waits[0] == 1
+        assert waits[1] == 2
+        assert waits[2] == 4
+
+    def test_backoff_capped_at_max_poll_interval(self):
+        """Backoff must not exceed max_poll_interval."""
+        poller, _ = self._make_poller(poll_interval=10, max_poll_interval=25)
+        waits = []
+
+        def capturing_wait(timeout=None):
+            if timeout and timeout > 0:
+                waits.append(timeout)
+            return True  # exit after each wait
+
+        poller._stopped.wait = capturing_wait
+
+        call_count = [0]
+
+        def always_500(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] > 5:
+                poller._stopped.set()
+            resp = _make_response(500, "err", b"err")
+            resp.close = MagicMock()
+            return resp
+
+        poller.session.get = always_500
+        poller.run()
+
+        assert all(w <= 25 for w in waits), f"All waits must be <= max_poll_interval, got {waits}"
+        assert 25 in waits, "Must reach the cap"
+
+    def test_consecutive_errors_reset_after_success(self):
+        """After a successful response the backoff counter must reset to zero.
+
+        Flow: 3×500 (backoff grows) → 200 (fetched_any=True, no wait, loop again)
+              → 204 (fetched_any=True still, no wait) → 204 (fetched_any=False,
+              wait=poll_interval proves backoff was reset).
+        """
+        poll_interval = 5
+        poller, received = self._make_poller(poll_interval=poll_interval, max_poll_interval=300)
+        waits = []
+        phase = [0]  # 0=error phase, 1=post-success empty polls
+
+        def capturing_wait(timeout=None):
+            if timeout and timeout > 0:
+                waits.append((phase[0], timeout))
+            # Stop once we have collected the post-recovery wait
+            if len(waits) >= 4:
+                poller._stopped.set()
+            return poller._stopped.is_set()
+
+        poller._stopped.wait = capturing_wait
+
+        call_count = [0]
+
+        def errors_then_success_then_empty(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 3:
+                resp = _make_response(500, "err", b"err")
+                resp.close = MagicMock()
+                return resp
+            if call_count[0] == 4:
+                # One 200 → fetched_any=True; inner loop continues, next call is 204
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.ok = True
+                resp.content = b"hello"
+                resp.headers = {"X-File-Name": "f.txt", "X-Create-Timestamp": ""}
+                resp.close = MagicMock()
+                return resp
+            # 204: inner loop breaks; first time fetched_any=True (no wait),
+            # second time fetched_any=False (wait=poll_interval → recorded as phase 1)
+            phase[0] = 1
+            resp = _make_response(204, "", b"")
+            resp.close = MagicMock()
+            return resp
+
+        poller.session.get = errors_then_success_then_empty
+        poller.run()
+
+        error_waits = [w for p, w in waits if p == 0]
+        post_recovery_waits = [w for p, w in waits if p == 1]
+
+        assert len(error_waits) >= 2, f"Expected growing error waits, got {error_waits}"
+        assert error_waits[1] > error_waits[0], "Backoff must grow during error phase"
+        assert post_recovery_waits, "Must wait after recovery"
+        assert post_recovery_waits[0] == poll_interval, (
+            f"First wait after recovery must be poll_interval={poll_interval}, got {post_recovery_waits[0]}"
+        )
+
+    def test_exception_also_triggers_backoff(self):
+        """Network exceptions (not just 5xx) must increment the backoff counter."""
+        poller, _ = self._make_poller(poll_interval=1, max_poll_interval=60)
+        waits = []
+
+        def capturing_wait(timeout=None):
+            if timeout and timeout > 0:
+                waits.append(timeout)
+            return True
+
+        poller._stopped.wait = capturing_wait
+
+        call_count = [0]
+
+        def always_raises(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] > 3:
+                poller._stopped.set()
+            raise ConnectionError("connection refused")
+
+        poller.session.get = always_raises
+        poller.run()
+
+        assert len(waits) >= 2
+        assert waits[1] > waits[0], "Backoff must grow for repeated exceptions"

@@ -130,9 +130,12 @@ class HttpPoller(Receiver, threading.Thread):
 
     def run(self) -> None:
         poll_interval = self.http_config.get('poll_interval', 5)
+        max_poll_interval = self.http_config.get('max_poll_interval', 300)
         timeout = self.http_config.get('timeout', 30)
+        consecutive_errors = 0
         while not self._stopped.is_set():
             fetched_any = False
+            had_error = False
             try:
                 while not self._stopped.is_set():
                     logger.debug("HTTP poll -> %s", self.url)
@@ -175,17 +178,33 @@ class HttpPoller(Receiver, threading.Thread):
                             continue
 
                         logger.error(f"HTTP poll failed {resp.status_code}: {resp.text}")
+                        had_error = True
                         break
                     finally:
                         resp.close()
             except Exception as e:
                 logger.error(f"HTTP polling error for {self.url}: {e}")
+                had_error = True
             finally:
-                # Only sleep when there is nothing left to pull
                 if self._stopped.is_set():
                     break
-                if not fetched_any:
-                    self._stopped.wait(poll_interval)
+                if had_error:
+                    consecutive_errors += 1
+                    wait = min(poll_interval * (2 ** (consecutive_errors - 1)), max_poll_interval)
+                    logger.warning(
+                        "HTTP poll backoff for %s: waiting %ss after %d consecutive error(s)",
+                        self.url, wait, consecutive_errors,
+                    )
+                    self._stopped.wait(wait)
+                else:
+                    if consecutive_errors > 0:
+                        logger.info(
+                            "HTTP poll %s: endpoint available again after %d consecutive error(s)",
+                            self.url, consecutive_errors,
+                        )
+                        consecutive_errors = 0
+                    if not fetched_any:
+                        self._stopped.wait(poll_interval)
 
     def start(self) -> None:  # type: ignore[override]
         threading.Thread.start(self)
