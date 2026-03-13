@@ -14,7 +14,7 @@ from charybdisk.transports.http_transport import HttpPoller
 from charybdisk.transports.kafka_transport import KafkaReceiver
 
 logger = logging.getLogger('charybdisk.consumer')
-KAFKA_RETRY_INTERVAL_SECONDS = 60
+KAFKA_RETRY_INTERVAL_SECONDS = 5
 
 
 class FileConsumerGroup(threading.Thread):

@@ -8,3 +8,8 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+tmp_path_retention_policy = "none"
+tmp_path_retention_count = 0
+basetemp = "D:/pytest-tmp"

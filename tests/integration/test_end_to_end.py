@@ -79,10 +79,14 @@ def services():
     print("[integration] waiting for HTTP test server health...")
     if not _wait_for_http_health("http://localhost:8080/health", timeout=60):
         pytest.fail("HTTP test server not reachable")
-    print("[integration] waiting for Kafka broker...")
+    print("[integration] waiting for Kafka broker (admin)...")
     ok, reason = _wait_for_kafka("127.0.0.1:29092", timeout=60)
     if not ok:
         pytest.fail(f"Kafka test broker not reachable: {reason}")
+    print("[integration] waiting for Kafka broker (produce-ready)...")
+    ok, reason = _wait_for_kafka_produce("127.0.0.1:29092", timeout=60)
+    if not ok:
+        pytest.fail(f"Kafka test broker not ready for produce: {reason}")
     yield
     print("------ ASKED FOR SHUTDOWN------")
     _compose_down(HTTP_COMPOSE_DIR)
@@ -122,6 +126,7 @@ def _wait_for_http_health(url: str, timeout=30):
 
 
 def _wait_for_kafka(broker: str, timeout=30):
+    """Wait until Kafka accepts admin API calls (broker is up)."""
     deadline = time.time() + timeout
     last_err = None
     while time.time() < deadline:
@@ -134,6 +139,34 @@ def _wait_for_kafka(broker: str, timeout=30):
             last_err = str(e)
             time.sleep(1)
     print(f"[integration] kafka not ready: {last_err}")
+    return False, last_err
+
+
+def _wait_for_kafka_produce(broker: str, timeout=30):
+    """Wait until Kafka is ready to actually produce messages.
+
+    `list_topics()` can succeed while the broker is still initialising and
+    not yet accepting produce requests.  This sends a real message to a
+    sentinel topic to confirm the broker is fully operational.
+    """
+    from kafka import KafkaProducer
+    deadline = time.time() + timeout
+    last_err = None
+    while time.time() < deadline:
+        try:
+            producer = KafkaProducer(
+                bootstrap_servers=broker,
+                request_timeout_ms=5000,
+                api_version_auto_timeout_ms=3000,
+            )
+            future = producer.send("__charybdisk_readiness__", b"ping")
+            future.get(timeout=5)
+            producer.close()
+            return True, None
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1)
+    print(f"[integration] kafka produce not ready: {last_err}")
     return False, last_err
 
 
@@ -233,6 +266,14 @@ def app_process(tmp_path_factory):
     if not ok:
         pytest.skip(f"Kafka test broker not reachable before app start: {reason}")
 
+    # Clear HTTP server state from any previous test run so leftover files
+    # in the download queue don't confuse this test's file-count accounting.
+    try:
+        r = requests.delete("http://localhost:8080/admin/clear", timeout=10)
+        print(f"[integration] HTTP server cleared: {r.json()}")
+    except Exception as e:
+        print(f"[integration] WARNING: could not clear HTTP server state: {e}")
+
     logs_dir = Path("integration_logs")
     logs_dir.mkdir(exist_ok=True)
     log_file = logs_dir / f"app_stdout_{uuid.uuid4().hex}.log"
@@ -245,11 +286,10 @@ def app_process(tmp_path_factory):
     env["PYTHONFAULTHANDLER"] = "1"
     env["PYTHONDEVMODE"] = "1"
 
-
-    # wait until Kafka is really ready
-    ok, reason = _wait_for_kafka("127.0.0.1:29092", timeout=60)
+    # Confirm Kafka is still ready for produce (not just admin) before starting the app.
+    ok, reason = _wait_for_kafka_produce("127.0.0.1:29092", timeout=30)
     if not ok:
-        pytest.fail("Kafka broker not ready")
+        pytest.fail(f"Kafka broker not produce-ready before app start: {reason}")
 
     print("START CHARYBDISK")
     proc = subprocess.Popen(
@@ -302,6 +342,8 @@ def app_process(tmp_path_factory):
         "dirs": dirs,
         "log_file": log_file,
         "integration_log": integ_log,
+        "logs_dir": logs_dir,
+        "env": env,
     }
 
     proc.terminate()
@@ -355,8 +397,16 @@ def test_end_to_end_http_and_kafka(app_process):
     # Kafka path
     assert _wait_for_file(dirs["download_kafka"] / large_kafka.name, timeout=120)
 
-    # HTTP failure path
-    assert _wait_for_file(dirs["error_http"] / "error" / bad_http.name, timeout=40)
+    # HTTP failure path: connection refused is a transient error, so CharybDisk must
+    # keep the file in pending/ for retry rather than permanently discarding it to error/.
+    pending_path = dirs["error_http"] / "pending" / bad_http.name
+    assert _wait_for_file(pending_path, timeout=15), (
+        "File for an unreachable endpoint must be moved to pending/ so it is retried"
+    )
+    error_path = dirs["error_http"] / "error" / bad_http.name
+    assert not error_path.exists(), (
+        "A transient connection error must NOT move the file to error/"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -372,23 +422,43 @@ def test_under_load_with_restarts(app_process):
     sent_http = 0
     sent_kafka = 0
 
-    def restarter(proc):
-        while time.time() < end_time and proc.poll() is None:
+    logs_dir = app_process["logs_dir"]
+    env = app_process["env"]
+    restart_count = [0]
+
+    def restarter():
+        # Always restart the *current* process, not the original one.
+        # Use a dedicated log file per restart so stdout never goes to a PIPE,
+        # which can deadlock once the OS pipe buffer fills up.
+        while time.time() < end_time:
             time.sleep(restart_every)
-            proc.terminate()
+            if time.time() >= end_time:
+                break
+            current = app_process["proc"]
+            if current.poll() is not None:
+                print("[integration] CharybDisk exited unexpectedly; stopping restarter")
+                break
+            config_path = current.args[-1]
+            current.terminate()
             try:
-                proc.wait(timeout=5)
+                current.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-
+                current.kill()
+                current.wait()
+            restart_count[0] += 1
+            restart_log = logs_dir / f"restart_{restart_count[0]}_{uuid.uuid4().hex}.log"
+            restart_fh = open(restart_log, "w", buffering=1)
             app_process["proc"] = subprocess.Popen(
-                ["python", "-u", "-m", "charybdisk", "--config", str(app_process["proc"].args[-1])],
-                stdout=subprocess.PIPE,
+                ["python", "-u", "-m", "charybdisk", "--config", config_path],
+                stdout=restart_fh,
                 stderr=subprocess.STDOUT,
-                bufsize=1, text=True,
+                text=True,
+                bufsize=1,
+                env=env,
             )
+            print(f"[integration] CharybDisk restarted (#{restart_count[0]}), log={restart_log}")
 
-    t = threading.Thread(target=restarter, args=(app_process["proc"],), daemon=False)
+    t = threading.Thread(target=restarter, daemon=False)
     t.start()
 
     while time.time() < end_time:

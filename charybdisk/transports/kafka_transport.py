@@ -90,6 +90,10 @@ class KafkaReceiver(Receiver, threading.Thread):
             'auto_offset_reset': 'latest' if start_from_end else kafka_config.get('auto_offset_reset', 'earliest'),
             'enable_auto_commit': kafka_config.get('enable_auto_commit', True),
             'value_deserializer': lambda x: x.decode('utf-8'),
+            # Refresh metadata every second so newly-created topics/partitions are
+            # discovered quickly (default is 5 minutes which causes the consumer to
+            # miss messages when the topic is created after the consumer starts).
+            'metadata_max_age_ms': kafka_config.get('metadata_max_age_ms', 1000),
         })
 
         self.consumer = KafkaConsumer(self.topic, **consumer_config)

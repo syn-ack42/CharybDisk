@@ -204,6 +204,37 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/admin/clear", methods=["DELETE"])
+def admin_clear():
+    """Remove all pending (non-done) files from every upload/download directory.
+
+    Called by integration tests between runs to prevent leftover files from one
+    test contaminating the next one's download queue.
+    """
+    removed = []
+    dirs_to_clear = set()
+    for ep in CONFIG.get("upload_endpoints", []):
+        dirs_to_clear.add(ep["save_dir"])
+    for ep in CONFIG.get("download_endpoints", []):
+        dirs_to_clear.add(ep["input_dir"])
+        dirs_to_clear.add(ep.get("done_dir", os.path.join(ep["input_dir"], "done")))
+
+    for d in dirs_to_clear:
+        p = Path(d)
+        if not p.exists():
+            continue
+        for f in p.iterdir():
+            if f.is_file():
+                try:
+                    f.unlink()
+                    removed.append(str(f))
+                except Exception as e:
+                    logger.warning(f"admin/clear: could not remove {f}: {e}")
+
+    logger.info(f"admin/clear: removed {len(removed)} file(s)")
+    return jsonify({"status": "ok", "removed": len(removed)}), 200
+
+
 if __name__ == "__main__":
     host = os.environ.get("HTTP_TEST_HOST", "0.0.0.0")
     port = int(os.environ.get("HTTP_TEST_PORT", "8080"))
